@@ -256,8 +256,4 @@ Includes a full end-to-end agent run that trains real models on California Housi
 
 MIT © 2026 — free to use, modify, and deploy.
 
----
 
-<div align="center">
-<b>If you find this useful, give it a ⭐ on GitHub!</b>
-</div>
