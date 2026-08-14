@@ -1,0 +1,4 @@
+# Aether is a Next.js + TypeScript application.
+# The optional Python extras below are only needed if you want the classic
+# MLflow UI pointed at the local file store written by the orchestrator.
+mlflow>=2.16.0

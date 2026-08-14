@@ -1,0 +1,102 @@
+@import "tailwindcss";
+
+:root {
+  --ink: #07080c;
+  --ink-2: #0d1018;
+  --panel: rgba(16, 20, 30, 0.78);
+  --line: rgba(180, 196, 230, 0.1);
+  --text: #e8ebf4;
+  --muted: #8b93a7;
+  --teal: #5eead4;
+  --indigo: #8b9cff;
+  --gold: #e3c27a;
+  --rose: #fb7185;
+  --lime: #86efac;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  color: var(--text);
+  background:
+    radial-gradient(1200px 600px at 10% -10%, rgba(94, 234, 212, 0.08), transparent 50%),
+    radial-gradient(900px 500px at 100% 0%, rgba(129, 140, 248, 0.12), transparent 46%),
+    linear-gradient(180deg, #07080c 0%, #0a0d14 100%);
+  font-family: var(--font-sans), sans-serif;
+}
+
+body::before {
+  content: "";
+  pointer-events: none;
+  position: fixed;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.015) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.015) 1px, transparent 1px);
+  background-size: 72px 72px;
+  mask-image: radial-gradient(ellipse at center, black 30%, transparent 80%);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(139, 147, 167, 0.28);
+  border-radius: 99px;
+}
+
+.mono {
+  font-family: var(--font-mono), ui-monospace, monospace;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(18px);
+}
+
+.hairline {
+  background: linear-gradient(90deg, transparent, rgba(227, 194, 122, 0.55), transparent);
+  height: 1px;
+}
+
+.pulse-dot {
+  box-shadow: 0 0 0 0 rgba(94, 234, 212, 0.7);
+  animation: pulse-dot 1.6s infinite;
+}
+
+@keyframes pulse-dot {
+  70% {
+    box-shadow: 0 0 0 8px rgba(94, 234, 212, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(94, 234, 212, 0);
+  }
+}
+
+.shimmer {
+  background: linear-gradient(110deg, transparent 20%, rgba(255, 255, 255, 0.08) 40%, transparent 60%);
+  background-size: 200% 100%;
+  animation: shimmer 2.2s infinite;
+}
+
+@keyframes shimmer {
+  to {
+    background-position-x: -200%;
+  }
+}
+
+.phase-active {
+  box-shadow: 0 0 0 1px rgba(94, 234, 212, 0.45), 0 0 28px rgba(94, 234, 212, 0.12);
+}

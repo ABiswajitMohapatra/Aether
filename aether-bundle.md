@@ -1,0 +1,3415 @@
+﻿
+===== FILE: src\app\api\datasets\preview\route.ts =====
+
+import { jsonError } from "@/lib/api";
+import { parseCsv } from "@/lib/ml/preprocess";
+
+export const dynamic = "force-dynamic";
+
+export async function POST(request: Request) {
+  const form = await request.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return jsonError("Upload a CSV file");
+  const text = await file.text();
+  const parsed = parseCsv(text);
+  return Response.json({
+    headers: parsed.headers,
+    preview: parsed.rows.slice(0, 6),
+    rowCount: parsed.rows.length,
+  });
+}
+
+===== FILE: src\app\api\datasets\route.ts =====
+
+import { desc } from "drizzle-orm";
+import { db } from "@/db";
+import { datasets } from "@/db/schema";
+import { jsonError, publicDataset } from "@/lib/api";
+import { createId } from "@/lib/id";
+import { computeDatasetStats, csvToPayload, parseCsv } from "@/lib/ml/preprocess";
+import { ensureSeeded } from "@/lib/seed";
+
+export const dynamic = "force-dynamic";
+
+export async function GET() {
+  await ensureSeeded();
+  const rows = await db.select().from(datasets).orderBy(desc(datasets.createdAt));
+  return Response.json({ datasets: rows.map(publicDataset) });
+}
+
+export async function POST(request: Request) {
+  await ensureSeeded();
+  const form = await request.formData();
+  const file = form.get("file");
+  const targetColumn = String(form.get("targetColumn") ?? "");
+  const name = String(form.get("name") ?? "").trim();
+  if (!(file instanceof File)) return jsonError("Upload a CSV file");
+  if (!targetColumn) return jsonError("Choose a target column");
+
+  const text = await file.text();
+  const parsed = parseCsv(text);
+  if (parsed.rows.length > 5000) return jsonError("Please keep uploaded CSVs to 5,000 rows or fewer");
+  const payload = csvToPayload(parsed.headers, parsed.rows, targetColumn);
+  const taskType = payload.classNames ? "classification" : "regression";
+  const stats = computeDatasetStats(payload, taskType);
+  const [row] = await db
+    .insert(datasets)
+    .values({
+      id: createId("ds"),
+      name: name || file.name.replace(/\.csv$/i, ""),
+      slug: `upload-${Date.now()}`,
+      source: "upload",
+      taskType,
+      targetColumn,
+      featureColumns: payload.featureNames,
+      rowCount: payload.X.length,
+      description: `Uploaded CSV with ${payload.X.length} rows.`,
+      stats,
+      payload,
+    })
+    .returning();
+  return Response.json({ dataset: publicDataset(row) });
+}
+
+===== FILE: src\app\api\health\route.ts =====
+
+import { db } from "@/db";
+import { sql } from "drizzle-orm";
+
+export const dynamic = "force-dynamic";
+
+export async function GET() {
+  try {
+    await db.execute(sql`select 1`);
+    return Response.json({ ok: true });
+  } catch {
+    return Response.json({ ok: false }, { status: 500 });
+  }
+}
+
+===== FILE: src\app\api\meta\route.ts =====
+
+import { describeLLM } from "@/lib/agent/llm";
+import { MODEL_REGISTRY } from "@/lib/ml/registry";
+
+export const dynamic = "force-dynamic";
+
+export async function GET() {
+  return Response.json({
+    llm: describeLLM(),
+    models: MODEL_REGISTRY.map((model) => ({
+      name: model.name,
+      label: model.label,
+      family: model.family,
+      tasks: model.tasks,
+      description: model.description,
+    })),
+  });
+}
+
+===== FILE: src\app\api\projects\[id]\route.ts =====
+
+
+===== FILE: src\app\api\projects\[id]\run\route.ts =====
+
+
+===== FILE: src\app\api\projects\[id]\start\route.ts =====
+
+
+===== FILE: src\app\api\projects\[id]\step\route.ts =====
+
+
+===== FILE: src\app\api\projects\route.ts =====
+
+import { desc } from "drizzle-orm";
+import { db } from "@/db";
+import { projects } from "@/db/schema";
+import { jsonError, publicProject } from "@/lib/api";
+import { createId } from "@/lib/id";
+import { ensureSeeded } from "@/lib/seed";
+
+export const dynamic = "force-dynamic";
+
+export async function GET() {
+  await ensureSeeded();
+  const rows = await db.select().from(projects).orderBy(desc(projects.updatedAt));
+  return Response.json({ projects: rows.map(publicProject) });
+}
+
+export async function POST(request: Request) {
+  await ensureSeeded();
+  const body = (await request.json()) as {
+    name?: string;
+    goal?: string;
+    datasetId?: string;
+    maxExperiments?: number;
+    minExperiments?: number;
+  };
+  if (!body.goal?.trim()) return jsonError("A natural-language goal is required");
+  if (!body.datasetId) return jsonError("Select a dataset");
+
+  const minExperiments = Math.min(12, Math.max(3, Number(body.minExperiments ?? 5) || 5));
+  const maxExperiments = Math.min(12, Math.max(minExperiments, Number(body.maxExperiments ?? 6) || 6));
+  const [row] = await db
+    .insert(projects)
+    .values({
+      id: createId("prj"),
+      name: body.name?.trim() || deriveName(body.goal),
+      goal: body.goal.trim(),
+      datasetId: body.datasetId,
+      minExperiments,
+      maxExperiments,
+      status: "draft",
+      phase: "idle",
+    })
+    .returning();
+  return Response.json({ project: publicProject(row) });
+}
+
+function deriveName(goal: string) {
+  const clipped = goal.replace(/\s+/g, " ").trim();
+  return clipped.length > 42 ? `${clipped.slice(0, 42)}â€¦` : clipped || "Untitled experiment";
+}
+
+===== FILE: src\db\index.ts =====
+
+import { drizzle } from "drizzle-orm/node-postgres";
+import { Pool } from "pg";
+
+const databaseUrl = process.env.DATABASE_URL;
+
+if (!databaseUrl) {
+  throw new Error("DATABASE_URL is required");
+}
+
+const globalForDb = globalThis as typeof globalThis & {
+  __arenaNextJsPostgresqlPool?: Pool;
+};
+
+export const pool =
+  globalForDb.__arenaNextJsPostgresqlPool ??
+  new Pool({
+    connectionString: databaseUrl,
+  });
+
+if (process.env.NODE_ENV !== "production") {
+  globalForDb.__arenaNextJsPostgresqlPool = pool;
+}
+
+export const db = drizzle(pool);
+
+===== FILE: src\db\schema.ts =====
+
+import { integer, jsonb, pgTable, text, timestamp } from "drizzle-orm/pg-core";
+import type {
+  AgentPhase,
+  DatasetPayload,
+  DatasetStats,
+  ExperimentPlan,
+  FeatureImportance,
+  FinalReport,
+  HyperParams,
+  Metrics,
+  PredictionPreview,
+  ProjectStatus,
+  TaskType,
+} from "@/lib/domain";
+
+export const datasets = pgTable("datasets", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  slug: text("slug").notNull().unique(),
+  source: text("source").notNull(),
+  taskType: text("task_type").$type<TaskType>().notNull(),
+  targetColumn: text("target_column").notNull(),
+  featureColumns: jsonb("feature_columns").$type<string[]>().notNull(),
+  rowCount: integer("row_count").notNull(),
+  description: text("description").notNull(),
+  stats: jsonb("stats").$type<DatasetStats>().notNull(),
+  payload: jsonb("payload").$type<DatasetPayload>().notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const projects = pgTable("projects", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  goal: text("goal").notNull(),
+  status: text("status").$type<ProjectStatus>().notNull().default("draft"),
+  phase: text("phase").$type<AgentPhase>().notNull().default("idle"),
+  taskType: text("task_type").$type<TaskType>(),
+  primaryMetric: text("primary_metric"),
+  optimize: text("optimize"),
+  datasetId: text("dataset_id").references(() => datasets.id),
+  maxExperiments: integer("max_experiments").notNull().default(6),
+  minExperiments: integer("min_experiments").notNull().default(5),
+  bestExperimentId: text("best_experiment_id"),
+  plan: jsonb("plan").$type<ExperimentPlan | null>(),
+  report: jsonb("report").$type<FinalReport | null>(),
+  summary: text("summary"),
+  error: text("error"),
+  nextConfig: jsonb("next_config"),
+  iteration: integer("iteration").notNull().default(0),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const experiments = pgTable("experiments", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  runNumber: integer("run_number").notNull(),
+  modelName: text("model_name").notNull(),
+  hyperparameters: jsonb("hyperparameters").$type<HyperParams>().notNull(),
+  datasetInfo: jsonb("dataset_info").$type<Record<string, unknown>>(),
+  status: text("status").notNull().default("queued"),
+  trainMetrics: jsonb("train_metrics").$type<Metrics | null>(),
+  testMetrics: jsonb("test_metrics").$type<Metrics | null>(),
+  featureImportance: jsonb("feature_importance").$type<FeatureImportance[] | null>(),
+  preview: jsonb("preview").$type<PredictionPreview | null>(),
+  coefficients: jsonb("coefficients").$type<Record<string, number> | null>(),
+  trainDurationMs: integer("train_duration_ms"),
+  notes: text("notes"),
+  decisionReason: text("decision_reason"),
+  trackingUri: text("tracking_uri"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+});
+
+export const agentLogs = pgTable("agent_logs", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  experimentId: text("experiment_id"),
+  node: text("node").notNull(),
+  phase: text("phase").notNull(),
+  level: text("level").notNull().default("info"),
+  message: text("message").notNull(),
+  payload: jsonb("payload"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const trackingRuns = pgTable("tracking_runs", {
+  id: text("id").primaryKey(),
+  experimentId: text("experiment_id")
+    .notNull()
+    .references(() => experiments.id, { onDelete: "cascade" }),
+  projectId: text("project_id").notNull(),
+  name: text("name").notNull(),
+  params: jsonb("params").$type<HyperParams>().notNull(),
+  metrics: jsonb("metrics").$type<Metrics>().notNull(),
+  tags: jsonb("tags").$type<Record<string, string>>().notNull(),
+  artifactUri: text("artifact_uri"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export type DatasetRow = typeof datasets.$inferSelect;
+export type ProjectRow = typeof projects.$inferSelect;
+export type ExperimentRow = typeof experiments.$inferSelect;
+export type AgentLogRow = typeof agentLogs.$inferSelect;
+
+===== FILE: src\lib\agent\graph.ts =====
+
+import { desc, eq } from "drizzle-orm";
+import { db } from "@/db";
+import { agentLogs, datasets, experiments, projects } from "@/db/schema";
+import type {
+  AgentPhase,
+  ExperimentConfig,
+  ExperimentPlan,
+  FinalReport,
+} from "@/lib/domain";
+import { createId } from "@/lib/id";
+import { logger } from "@/lib/logger";
+import { runSafeExperiment } from "@/lib/ml/engine";
+import { metricValue } from "@/lib/ml/metrics";
+import { configSignature, modelLabel } from "@/lib/ml/registry";
+import { logTrackingRun } from "@/lib/tracking/store";
+import { completeJson } from "@/lib/agent/llm";
+import {
+  analyzeRuns,
+  buildHeuristicPlan,
+  parseGoal,
+  pickBestRun,
+  suggestNextExperiment,
+  writeReport,
+  type CompletedRun,
+} from "@/lib/agent/policy";
+
+async function writeLog(
+  projectId: string,
+  node: string,
+  phase: AgentPhase,
+  message: string,
+  level: "info" | "success" | "warn" | "error" = "info",
+  payload?: unknown,
+  experimentId?: string,
+) {
+  await db.insert(agentLogs).values({
+    id: createId("log"),
+    projectId,
+    experimentId,
+    node,
+    phase,
+    level,
+    message,
+    payload: payload ?? null,
+  });
+}
+
+async function setPhase(projectId: string, phase: AgentPhase, extra?: Partial<typeof projects.$inferInsert>) {
+  await db
+    .update(projects)
+    .set({ phase, updatedAt: new Date(), ...extra })
+    .where(eq(projects.id, projectId));
+}
+
+function asCompleted(rows: Array<typeof experiments.$inferSelect>): CompletedRun[] {
+  return rows
+    .filter((row) => row.status === "completed" && row.testMetrics)
+    .map((row) => ({
+      modelName: row.modelName,
+      hyperparameters: row.hyperparameters,
+      trainMetrics: row.trainMetrics,
+      testMetrics: row.testMetrics,
+    }));
+}
+
+export async function startProject(projectId: string) {
+  const [project] = await db.select().from(projects).where(eq(projects.id, projectId));
+  if (!project) throw new Error("Project not found");
+  if (!project.datasetId) throw new Error("Select a dataset before starting");
+  const [dataset] = await db.select().from(datasets).where(eq(datasets.id, project.datasetId));
+  if (!dataset) throw new Error("Dataset not found");
+
+  await db.delete(experiments).where(eq(experiments.projectId, projectId));
+  await db.delete(agentLogs).where(eq(agentLogs.projectId, projectId));
+
+  await setPhase(projectId, "analyzing_dataset", {
+    status: "running",
+    error: null,
+    report: null,
+    summary: null,
+    bestExperimentId: null,
+    iteration: 0,
+    nextConfig: null,
+  });
+  await writeLog(
+    projectId,
+    "dataset_analyst",
+    "analyzing_dataset",
+    `Inspecting ${dataset.name}: ${dataset.rowCount} rows, ${dataset.featureColumns.length} features, target ${dataset.targetColumn}.`,
+  );
+
+  const parsed = parseGoal(project.goal, dataset.taskType);
+  const top = dataset.stats.correlations?.slice(0, 4) ?? [];
+  await writeLog(
+    projectId,
+    "dataset_analyst",
+    "analyzing_dataset",
+    `Task inferred as ${parsed.taskType}. Strongest signals: ${
+      top.map((item) => `${item.feature} (r=${item.corr.toFixed(2)})`).join(", ") || "n/a"
+    }.`,
+    "success",
+    { stats: dataset.stats, parsed },
+  );
+
+  await setPhase(projectId, "planning");
+  await writeLog(projectId, "planner", "planning", "Creating an experiment strategy from the goal and dataset profile.");
+
+  const fallbackPlan = buildHeuristicPlan(
+    project.goal,
+    dataset.stats,
+    dataset.taskType,
+    project.minExperiments,
+    project.maxExperiments,
+  );
+
+  const planned = await completeJson<ExperimentPlan>(
+    "You are the planner node of an ML experiment orchestrator. Return only JSON matching the experiment plan schema. Use only these model names: linear_regression, ridge, lasso, elastic_net, knn, decision_tree, random_forest, gradient_boosting, logistic_regression. Never invent models or execute code.",
+    JSON.stringify(
+      {
+        goal: project.goal,
+        dataset: {
+          name: dataset.name,
+          taskType: dataset.taskType,
+          stats: dataset.stats,
+        },
+        availableModels: fallbackPlan.strategy.map((item) => item.model),
+        constraints: {
+          minExperiments: project.minExperiments,
+          maxExperiments: project.maxExperiments,
+        },
+      },
+      null,
+      2,
+    ),
+    () => fallbackPlan,
+  );
+
+  const plan: ExperimentPlan = {
+    ...fallbackPlan,
+    ...planned.value,
+    taskType: dataset.taskType,
+    minExperiments: project.minExperiments,
+    maxExperiments: project.maxExperiments,
+    strategy: (planned.value.strategy?.length ? planned.value.strategy : fallbackPlan.strategy).slice(
+      0,
+      project.maxExperiments,
+    ),
+  };
+
+  const first = plan.strategy[0] ?? null;
+  await setPhase(projectId, "planning", {
+    plan,
+    taskType: plan.taskType,
+    primaryMetric: plan.primaryMetric,
+    optimize: plan.optimize,
+    nextConfig: first,
+    summary: plan.rationale,
+  });
+  await writeLog(
+    projectId,
+    "planner",
+    "planning",
+    `Plan ready (${planned.source}): ${plan.rationale}`,
+    "success",
+    plan,
+  );
+  if (first) {
+    await writeLog(
+      projectId,
+      "planner",
+      "planning",
+      `First experiment queued: ${modelLabel(first.model)} â€” ${first.reason}`,
+    );
+  }
+
+  return { plan, first };
+}
+
+export async function stepProject(projectId: string) {
+  const [project] = await db.select().from(projects).where(eq(projects.id, projectId));
+  if (!project) throw new Error("Project not found");
+  if (project.status !== "running") {
+    return { done: project.status === "completed", project };
+  }
+  if (!project.datasetId || !project.plan) {
+    throw new Error("Project is missing a dataset or plan");
+  }
+  const [dataset] = await db.select().from(datasets).where(eq(datasets.id, project.datasetId));
+  if (!dataset) throw new Error("Dataset not found");
+
+  const history = await db
+    .select()
+    .from(experiments)
+    .where(eq(experiments.projectId, projectId))
+    .orderBy(experiments.runNumber);
+
+  const completed = asCompleted(history);
+  const plan = project.plan;
+  const pending = (project.nextConfig as ExperimentConfig | null) ?? null;
+
+  if (!pending) {
+    return finalize(projectId, project, dataset, completed, plan);
+  }
+
+  const runNumber = history.length + 1;
+  const experimentId = createId("exp");
+
+  await setPhase(projectId, "selecting");
+  await writeLog(
+    projectId,
+    "selector",
+    "selecting",
+    `Selected experiment ${runNumber}: ${modelLabel(pending.model)} ${JSON.stringify(pending.params)}`,
+    "info",
+    pending,
+    experimentId,
+  );
+
+  await db.insert(experiments).values({
+    id: experimentId,
+    projectId,
+    runNumber,
+    modelName: pending.model,
+    hyperparameters: pending.params,
+    datasetInfo: {
+      name: dataset.name,
+      rows: dataset.rowCount,
+      features: dataset.featureColumns,
+      target: dataset.targetColumn,
+      split: "80/20 holdout",
+    },
+    status: "running",
+    decisionReason: pending.reason,
+  });
+
+  await setPhase(projectId, "training");
+  await writeLog(
+    projectId,
+    "executor",
+    "training",
+    `Training ${modelLabel(pending.model)} on ${dataset.name}. Arbitrary generated code is not executed; only the validated registry path runs.`,
+    "info",
+    undefined,
+    experimentId,
+  );
+
+  try {
+    const result = runSafeExperiment({
+      model: pending.model,
+      params: pending.params,
+      task: dataset.taskType,
+      X: dataset.payload.X,
+      y: dataset.payload.y,
+      featureNames: dataset.payload.featureNames,
+      seed: 42 + runNumber,
+    });
+
+    await setPhase(projectId, "evaluating");
+    await writeLog(
+      projectId,
+      "evaluator",
+      "evaluating",
+      `Holdout ${plan.primaryMetric}=${metricValue(result.testMetrics, plan.primaryMetric).toFixed(4)} in ${result.durationMs}ms.`,
+      "success",
+      result.testMetrics,
+      experimentId,
+    );
+
+    await db
+      .update(experiments)
+      .set({
+        status: "completed",
+        trainMetrics: result.trainMetrics,
+        testMetrics: result.testMetrics,
+        featureImportance: result.featureImportance,
+        preview: result.preview,
+        coefficients: result.coefficients,
+        trainDurationMs: result.durationMs,
+        notes: pending.reason,
+        completedAt: new Date(),
+      })
+      .where(eq(experiments.id, experimentId));
+
+    await logTrackingRun({
+      id: createId("run"),
+      experimentId,
+      projectId,
+      name: `${pending.model}-${runNumber}`,
+      params: result.params,
+      metrics: result.testMetrics,
+      tags: {
+        dataset: dataset.slug,
+        task: dataset.taskType,
+        metric: plan.primaryMetric,
+      },
+    });
+
+    const updatedCompleted: CompletedRun[] = [
+      ...completed,
+      {
+        modelName: result.model,
+        hyperparameters: result.params,
+        trainMetrics: result.trainMetrics,
+        testMetrics: result.testMetrics,
+      },
+    ];
+
+    await setPhase(projectId, "analyzing");
+    const analysisFallback = analyzeRuns(
+      updatedCompleted,
+      updatedCompleted[updatedCompleted.length - 1],
+      plan.primaryMetric,
+      plan.optimize,
+    );
+    const analysis = await completeJson<{ commentary: string }>(
+      "You are the experiment analyst. Return JSON {commentary: string} using only the provided metrics. Do not invent numbers.",
+      JSON.stringify({
+        metric: plan.primaryMetric,
+        optimize: plan.optimize,
+        latest: updatedCompleted[updatedCompleted.length - 1],
+        history: updatedCompleted,
+      }),
+      () => ({ commentary: analysisFallback.commentary }),
+    );
+    await writeLog(
+      projectId,
+      "analyst",
+      "analyzing",
+      analysis.value.commentary || analysisFallback.commentary,
+      "info",
+      analysisFallback,
+      experimentId,
+    );
+
+    const { best } = pickBestRun(updatedCompleted, plan.primaryMetric, plan.optimize);
+    const bestRow = (
+      await db.select().from(experiments).where(eq(experiments.projectId, projectId))
+    ).find(
+      (row) =>
+        best !== null &&
+        row.status === "completed" &&
+        configSignature(row.modelName, row.hyperparameters) ===
+          configSignature(best.modelName, best.hyperparameters),
+    );
+
+    await setPhase(projectId, "deciding");
+    const decisionFallback = suggestNextExperiment(plan, updatedCompleted);
+    const decision = await completeJson<{ stop: boolean; reason: string; config?: ExperimentConfig | null }>(
+      "You are the decision agent. Return JSON {stop:boolean, reason:string, config?:{model,params,reason}|null}. Use only registry models and numeric params. Prefer stopping after the minimum experiments if gains are tiny.",
+      JSON.stringify({
+        plan,
+        completed: updatedCompleted,
+        suggested: decisionFallback,
+      }),
+      () => decisionFallback,
+    );
+
+    const nextConfig =
+      decision.value.stop || updatedCompleted.length >= plan.maxExperiments
+        ? null
+        : (decision.value.config ?? decisionFallback.config);
+
+    await setPhase(projectId, nextConfig ? "deciding" : "reporting", {
+      iteration: runNumber,
+      nextConfig,
+      bestExperimentId: bestRow?.id ?? experimentId,
+    });
+    await writeLog(
+      projectId,
+      "decision",
+      "deciding",
+      nextConfig
+        ? `${decision.value.reason || decisionFallback.reason} Next: ${modelLabel(nextConfig.model)}.`
+        : decision.value.reason || decisionFallback.reason,
+      nextConfig ? "info" : "success",
+      { nextConfig, stop: !nextConfig },
+      experimentId,
+    );
+
+    if (!nextConfig) {
+      return finalize(projectId, { ...project, bestExperimentId: bestRow?.id ?? experimentId }, dataset, updatedCompleted, plan);
+    }
+
+    return { done: false, experimentId };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Training failed";
+    logger.error("executor", message, error);
+    await db
+      .update(experiments)
+      .set({ status: "failed", notes: message, completedAt: new Date() })
+      .where(eq(experiments.id, experimentId));
+    await writeLog(projectId, "executor", "training", message, "error", undefined, experimentId);
+
+    const fallback = suggestNextExperiment(plan, completed);
+    await setPhase(projectId, fallback.config ? "deciding" : "failed", {
+      nextConfig: fallback.config,
+      error: fallback.config ? null : message,
+      status: fallback.config ? "running" : "failed",
+    });
+    return { done: !fallback.config, error: message };
+  }
+}
+
+async function finalize(
+  projectId: string,
+  project: typeof projects.$inferSelect,
+  dataset: typeof datasets.$inferSelect,
+  completed: CompletedRun[],
+  plan: ExperimentPlan,
+) {
+  await setPhase(projectId, "reporting");
+  const { best } = pickBestRun(completed, plan.primaryMetric, plan.optimize);
+  const fallback = writeReport(project.goal, dataset.stats, plan, completed, best);
+  const generated = await completeJson<FinalReport>(
+    "You are the final report agent. Return JSON with keys headline, narrative, bestModel, bestParams, bestMetrics, whyItWon, datasetInsights, experimentLessons, recommendedNextSteps. Use only provided metrics.",
+    JSON.stringify({ goal: project.goal, plan, dataset: dataset.stats, completed, fallback }),
+    () => fallback,
+  );
+  const report = { ...fallback, ...generated.value, bestMetrics: best?.testMetrics ?? fallback.bestMetrics };
+
+  await setPhase(projectId, "completed", {
+    status: "completed",
+    report,
+    summary: report.narrative,
+    nextConfig: null,
+  });
+  await writeLog(projectId, "reporter", "completed", report.headline, "success", report);
+  return { done: true, report };
+}
+
+export async function runProjectToCompletion(projectId: string) {
+  await startProject(projectId);
+  let guard = 0;
+  while (guard < 20) {
+    const result = await stepProject(projectId);
+    if (result.done) return result;
+    guard += 1;
+  }
+  throw new Error("Experiment loop exceeded the safety guard");
+}
+
+export async function loadProjectBundle(projectId: string) {
+  const [project] = await db.select().from(projects).where(eq(projects.id, projectId));
+  if (!project) return null;
+  const [dataset] = project.datasetId
+    ? await db.select().from(datasets).where(eq(datasets.id, project.datasetId))
+    : [null];
+  const runs = await db
+    .select()
+    .from(experiments)
+    .where(eq(experiments.projectId, projectId))
+    .orderBy(experiments.runNumber);
+  const logs = await db
+    .select()
+    .from(agentLogs)
+    .where(eq(agentLogs.projectId, projectId))
+    .orderBy(desc(agentLogs.createdAt));
+  return { project, dataset, experiments: runs, logs: logs.reverse() };
+}
+
+===== FILE: src\lib\agent\llm.ts =====
+
+import { logger } from "@/lib/logger";
+
+export interface LLMCompleteOptions {
+  json?: boolean;
+  temperature?: number;
+}
+
+export interface LLMProvider {
+  id: string;
+  label: string;
+  isGenerative: boolean;
+  complete(system: string, user: string, options?: LLMCompleteOptions): Promise<string>;
+}
+
+function env(name: string) {
+  const value = process.env[name];
+  return value && value.trim().length > 0 ? value.trim() : null;
+}
+
+class OpenAICompatibleProvider implements LLMProvider {
+  id = "openai-compatible";
+  label: string;
+  isGenerative = true;
+  constructor(
+    private readonly baseUrl: string,
+    private readonly apiKey: string,
+    private readonly model: string,
+    label: string,
+  ) {
+    this.label = label;
+  }
+
+  async complete(system: string, user: string, options?: LLMCompleteOptions) {
+    const response = await fetch(`${this.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: this.model,
+        temperature: options?.temperature ?? 0.2,
+        response_format: options?.json ? { type: "json_object" } : undefined,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
+      }),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`OpenAI-compatible LLM failed: ${response.status} ${text}`);
+    }
+    const data = (await response.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const content = data.choices?.[0]?.message?.content;
+    if (!content) throw new Error("LLM returned an empty completion");
+    return content;
+  }
+}
+
+class AnthropicProvider implements LLMProvider {
+  id = "anthropic";
+  label = "Anthropic";
+  isGenerative = true;
+
+  constructor(
+    private readonly apiKey: string,
+    private readonly model: string,
+  ) {}
+
+  async complete(system: string, user: string, options?: LLMCompleteOptions) {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": this.apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: this.model,
+        max_tokens: 1400,
+        temperature: options?.temperature ?? 0.2,
+        system,
+        messages: [{ role: "user", content: user }],
+      }),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Anthropic LLM failed: ${response.status} ${text}`);
+    }
+    const data = (await response.json()) as { content?: Array<{ text?: string }> };
+    const content = data.content?.map((part) => part.text ?? "").join("");
+    if (!content) throw new Error("Anthropic returned an empty completion");
+    return content;
+  }
+}
+
+class OllamaProvider implements LLMProvider {
+  id = "ollama";
+  label: string;
+  isGenerative = true;
+  constructor(
+    private readonly baseUrl: string,
+    private readonly model: string,
+  ) {
+    this.label = `Ollama / ${model}`;
+  }
+
+  async complete(system: string, user: string, options?: LLMCompleteOptions) {
+    const response = await fetch(`${this.baseUrl.replace(/\/$/, "")}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: this.model,
+        stream: false,
+        format: options?.json ? "json" : undefined,
+        options: { temperature: options?.temperature ?? 0.2 },
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
+      }),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Ollama failed: ${response.status} ${text}`);
+    }
+    const data = (await response.json()) as { message?: { content?: string } };
+    if (!data.message?.content) throw new Error("Ollama returned an empty completion");
+    return data.message.content;
+  }
+}
+
+let cached: LLMProvider | null = null;
+let generativeDisabled = process.env.FORCE_POLICY_ENGINE === "1";
+
+export function getLLM(): LLMProvider {
+  if (cached) return cached;
+
+  const openaiKey = env("OPENAI_API_KEY");
+  const openaiBase = env("OPENAI_BASE_URL");
+  const openaiModel = env("OPENAI_MODEL") ?? env("LLM_MODEL") ?? "gpt-4o-mini";
+  if (openaiKey) {
+    cached = new OpenAICompatibleProvider(
+      openaiBase ?? "https://api.openai.com/v1",
+      openaiKey,
+      openaiModel,
+      openaiBase ? `OpenAI-compatible / ${openaiModel}` : `OpenAI / ${openaiModel}`,
+    );
+    return cached;
+  }
+
+  const anthropicKey = env("ANTHROPIC_API_KEY");
+  if (anthropicKey) {
+    cached = new AnthropicProvider(anthropicKey, env("ANTHROPIC_MODEL") ?? "claude-3-5-sonnet-latest");
+    return cached;
+  }
+
+  const ollamaBase = env("OLLAMA_BASE_URL") ?? "http://127.0.0.1:11434";
+  const ollamaModel = env("OLLAMA_MODEL") ?? "qwen2.5:7b";
+  cached = new OllamaProvider(ollamaBase, ollamaModel);
+  return cached;
+}
+
+export async function completeJson<T>(
+  system: string,
+  user: string,
+  fallback: () => T,
+): Promise<{ value: T; source: "llm" | "policy" }> {
+  if (generativeDisabled) {
+    return { value: fallback(), source: "policy" };
+  }
+  const llm = getLLM();
+  try {
+    const raw = await Promise.race([
+      llm.complete(system, user, { json: true, temperature: 0.15 }),
+      new Promise<string>((_, reject) => {
+        setTimeout(() => reject(new Error("LLM timeout")), 4000);
+      }),
+    ]);
+    const start = raw.indexOf("{");
+    const end = raw.lastIndexOf("}");
+    const slice = start >= 0 && end >= 0 ? raw.slice(start, end + 1) : raw;
+    return { value: JSON.parse(slice) as T, source: "llm" };
+  } catch (error) {
+    generativeDisabled = true;
+    logger.warn("llm", "Generative LLM unavailable or returned invalid JSON; using policy engine", error);
+    return { value: fallback(), source: "policy" };
+  }
+}
+
+export function describeLLM() {
+  const openaiKey = env("OPENAI_API_KEY");
+  if (openaiKey) {
+    return {
+      id: "openai-compatible",
+      label: env("OPENAI_BASE_URL") ? "OpenAI-compatible" : "OpenAI",
+      model: env("OPENAI_MODEL") ?? "gpt-4o-mini",
+      generative: true,
+    };
+  }
+  if (env("ANTHROPIC_API_KEY")) {
+    return {
+      id: "anthropic",
+      label: "Anthropic",
+      model: env("ANTHROPIC_MODEL") ?? "claude-3-5-sonnet-latest",
+      generative: true,
+    };
+  }
+  return {
+    id: "ollama-or-policy",
+    label: "Ollama / Adaptive policy",
+    model: env("OLLAMA_MODEL") ?? "qwen2.5:7b",
+    generative: false,
+  };
+}
+
+===== FILE: src\lib\agent\policy.ts =====
+
+import type {
+  DatasetStats,
+  ExperimentConfig,
+  ExperimentPlan,
+  HyperParams,
+  MetricName,
+  Metrics,
+  ModelName,
+  OptimizeDirection,
+  TaskType,
+} from "@/lib/domain";
+import { isBetter, metricValue } from "@/lib/ml/metrics";
+import { configSignature, familyOf, modelsForTask, SEARCH_SPACES } from "@/lib/ml/registry";
+
+export interface CompletedRun {
+  modelName: string;
+  hyperparameters: HyperParams;
+  trainMetrics: Metrics | null;
+  testMetrics: Metrics | null;
+}
+
+export function parseGoal(goal: string, datasetTask?: TaskType | null) {
+  const text = goal.toLowerCase();
+  const taskType: TaskType =
+    datasetTask ??
+    (/(classif|accuracy|precision|recall|f1|logistic|iris|churn|income)/.test(text)
+      ? "classification"
+      : "regression");
+
+  let primaryMetric: MetricName = taskType === "classification" ? "accuracy" : "rmse";
+  if (text.includes("mae")) primaryMetric = "mae";
+  else if (text.includes("r2") || text.includes("rÂ²")) primaryMetric = "r2";
+  else if (text.includes("mape")) primaryMetric = "mape";
+  else if (text.includes("precision")) primaryMetric = "precision";
+  else if (text.includes("recall")) primaryMetric = "recall";
+  else if (text.includes("f1")) primaryMetric = "f1";
+  else if (text.includes("accuracy")) primaryMetric = "accuracy";
+  else if (text.includes("rmse") || text.includes("root mean")) primaryMetric = "rmse";
+
+  const optimize: OptimizeDirection =
+    primaryMetric === "r2" ||
+    primaryMetric === "accuracy" ||
+    primaryMetric === "precision" ||
+    primaryMetric === "recall" ||
+    primaryMetric === "f1"
+      ? "maximize"
+      : "minimize";
+
+  const minMatch = text.match(/at least (\d+)/);
+  const maxMatch = text.match(/(?:at most|no more than|max(?:imum)?)\s+(\d+)/);
+  const minExperiments = minMatch ? Math.max(3, Number(minMatch[1])) : 5;
+  const maxExperiments = maxMatch ? Math.max(minExperiments, Number(maxMatch[1])) : Math.max(minExperiments, 6);
+
+  return { taskType, primaryMetric, optimize, minExperiments, maxExperiments };
+}
+
+function defaultStrategy(task: TaskType): ExperimentConfig[] {
+  if (task === "classification") {
+    return [
+      { model: "logistic_regression", params: { learningRate: 0.2, epochs: 180, l2: 0.01 }, reason: "Linear baseline for the classification boundary." },
+      { model: "knn", params: { k: 7, weighted: true }, reason: "Non-parametric neighborhood vote." },
+      { model: "decision_tree", params: { maxDepth: 6, minSamplesSplit: 8, minSamplesLeaf: 3 }, reason: "Interpretable non-linear splits." },
+      { model: "random_forest", params: { nEstimators: 24, maxDepth: 8, minSamplesLeaf: 2, maxFeatures: "sqrt" }, reason: "Bagged trees to reduce variance." },
+      { model: "gradient_boosting", params: { nEstimators: 28, maxDepth: 3, learningRate: 0.1, subsample: 1 }, reason: "Boosted residual correction." },
+    ];
+  }
+  return [
+    { model: "linear_regression", params: {}, reason: "Unregularized linear baseline." },
+    { model: "ridge", params: { alpha: 1 }, reason: "Stabilize correlated housing/clinical features." },
+    { model: "decision_tree", params: { maxDepth: 6, minSamplesSplit: 8, minSamplesLeaf: 3 }, reason: "Capture non-linear thresholds." },
+    { model: "random_forest", params: { nEstimators: 24, maxDepth: 8, minSamplesLeaf: 2, maxFeatures: "sqrt" }, reason: "Ensemble of randomized trees." },
+    { model: "gradient_boosting", params: { nEstimators: 28, maxDepth: 3, learningRate: 0.1, subsample: 0.9 }, reason: "Sequential residual fitting for lower RMSE." },
+  ];
+}
+
+export function buildHeuristicPlan(
+  goal: string,
+  stats: DatasetStats,
+  datasetTask: TaskType,
+  requestedMin?: number,
+  requestedMax?: number,
+): ExperimentPlan {
+  const parsed = parseGoal(goal, datasetTask);
+  const minExperiments = requestedMin ?? parsed.minExperiments;
+  const maxExperiments = requestedMax ?? parsed.maxExperiments;
+  const strategy = defaultStrategy(parsed.taskType).slice(0, Math.max(minExperiments, 5));
+  const top = stats.correlations?.slice(0, 3).map((item) => item.feature).join(", ") ?? "the strongest features";
+  return {
+    taskType: parsed.taskType,
+    primaryMetric: parsed.primaryMetric,
+    optimize: parsed.optimize,
+    minExperiments,
+    maxExperiments,
+    rationale: `The goal is a ${parsed.taskType} problem optimized for ${parsed.primaryMetric}. ${top} look most informative, so the policy starts with a linear baseline, then trees and ensembles, then adaptive hyperparameter search.`,
+    strategy,
+    adaptationPolicy:
+      "After the first diverse sweep, exploit the winning family. If trees beat linear by >8%, spend remaining budget on forest/boosting. If a linear model is competitive, grid regularized linear models. If train metrics crush test metrics, reduce depth or increase regularization.",
+  };
+}
+
+export function pickBestRun(
+  runs: CompletedRun[],
+  metric: MetricName,
+  optimize: OptimizeDirection,
+) {
+  let best: CompletedRun | null = null;
+  let bestValue = Number.NaN;
+  for (const run of runs) {
+    const value = metricValue(run.testMetrics, metric);
+    if (isBetter(value, bestValue, optimize)) {
+      best = run;
+      bestValue = value;
+    }
+  }
+  return { best, bestValue };
+}
+
+function overfitGap(run: CompletedRun, metric: MetricName) {
+  const train = metricValue(run.trainMetrics, metric);
+  const test = metricValue(run.testMetrics, metric);
+  if (Number.isNaN(train) || Number.isNaN(test)) return 0;
+  return Math.abs(train - test) / (Math.abs(test) + 1e-9);
+}
+
+export function suggestNextExperiment(
+  plan: ExperimentPlan,
+  runs: CompletedRun[],
+): { config: ExperimentConfig | null; stop: boolean; reason: string } {
+  const tried = new Set(runs.map((run) => configSignature(run.modelName, run.hyperparameters)));
+  const unusedPlan = plan.strategy.filter(
+    (item) => !tried.has(configSignature(item.model, item.params)),
+  );
+
+  const exploreUntil = Math.min(Math.max(3, plan.minExperiments - 1), plan.strategy.length);
+  if (runs.length < exploreUntil && unusedPlan[0]) {
+    return {
+      config: unusedPlan[0],
+      stop: false,
+      reason: "Continue the planned exploration sweep before exploiting a winner.",
+    };
+  }
+
+  const { best, bestValue } = pickBestRun(runs, plan.primaryMetric, plan.optimize);
+  if (!best) {
+    return unusedPlan[0]
+      ? { config: unusedPlan[0], stop: false, reason: "No successful run yet; execute the next planned model." }
+      : { config: null, stop: true, reason: "No successful experiments to learn from." };
+  }
+
+  const recent = runs.slice(-2);
+  const recentImproved = recent.some((run) => {
+    const value = metricValue(run.testMetrics, plan.primaryMetric);
+    if (Number.isNaN(value) || Number.isNaN(bestValue)) return false;
+    const delta = plan.optimize === "minimize" ? (bestValue - value) / (Math.abs(bestValue) + 1e-9) : (value - bestValue) / (Math.abs(bestValue) + 1e-9);
+    return delta > -0.002;
+  });
+
+  if (runs.length >= plan.maxExperiments) {
+    return { config: null, stop: true, reason: `Reached the experiment budget of ${plan.maxExperiments}.` };
+  }
+
+  const tuned = tuneWinner(best, plan, tried);
+  if (tuned) {
+    return {
+      config: tuned,
+      stop: false,
+      reason: `Exploit the leading ${best.modelName} family using a nearby hyperparameter setting.`,
+    };
+  }
+
+  if (unusedPlan[0]) {
+    return { config: unusedPlan[0], stop: false, reason: "Explore a remaining planned algorithm." };
+  }
+
+  const alternative = firstUntriedFamily(plan.taskType, runs, tried);
+  if (alternative) {
+    return { config: alternative, stop: false, reason: "Try an unused model family to avoid local optima." };
+  }
+
+  if (runs.length >= plan.minExperiments && !recentImproved) {
+    return { config: null, stop: true, reason: "No material improvement remains and the minimum experiment count is satisfied." };
+  }
+
+  return { config: null, stop: true, reason: "Search space for safe configurations is exhausted." };
+}
+
+function firstUntriedFamily(task: TaskType, runs: CompletedRun[], tried: Set<string>): ExperimentConfig | null {
+  const usedFamilies = new Set(runs.map((run) => familyOf(run.modelName)));
+  for (const spec of modelsForTask(task)) {
+    if (usedFamilies.has(spec.family)) continue;
+    const params = Object.fromEntries(
+      Object.entries(spec.params).map(([key, value]) => [key, value.default]),
+    );
+    if (tried.has(configSignature(spec.name, params))) continue;
+    return { model: spec.name, params, reason: `Untried family ${spec.family}.` };
+  }
+  return null;
+}
+
+function tuneWinner(best: CompletedRun, plan: ExperimentPlan, tried: Set<string>): ExperimentConfig | null {
+  const model = best.modelName as ModelName;
+  const gap = overfitGap(best, plan.primaryMetric);
+  const candidates = [...(SEARCH_SPACES[model] ?? [])];
+
+  if (familyOf(model) === "ensemble" || familyOf(model) === "tree") {
+    if (gap > 0.18) {
+      candidates.unshift({
+        ...best.hyperparameters,
+        maxDepth: Math.max(2, Number(best.hyperparameters.maxDepth ?? 6) - 2),
+        minSamplesLeaf: Number(best.hyperparameters.minSamplesLeaf ?? 2) + 1,
+      });
+    } else {
+      candidates.unshift({
+        ...best.hyperparameters,
+        nEstimators: Math.min(64, Number(best.hyperparameters.nEstimators ?? 24) + 8),
+        maxDepth: Math.min(14, Number(best.hyperparameters.maxDepth ?? 6) + 1),
+      });
+    }
+  }
+
+  if (model === "ridge" || model === "lasso" || model === "elastic_net") {
+    const alpha = Number(best.hyperparameters.alpha ?? 1);
+    candidates.unshift({ alpha: alpha * 0.3 }, { alpha: alpha * 3 });
+  }
+
+  for (const params of candidates) {
+    const signature = configSignature(model, params);
+    if (!tried.has(signature)) {
+      return {
+        model,
+        params,
+        reason: gap > 0.18 ? "Reduce capacity to fight overfitting." : "Increase capacity around the current winner.",
+      };
+    }
+  }
+  return null;
+}
+
+export function analyzeRuns(
+  runs: CompletedRun[],
+  latest: CompletedRun,
+  metric: MetricName,
+  optimize: OptimizeDirection,
+) {
+  const { best, bestValue } = pickBestRun(runs, metric, optimize);
+  const latestValue = metricValue(latest.testMetrics, metric);
+  const trainValue = metricValue(latest.trainMetrics, metric);
+  const improved = best?.modelName === latest.modelName && Math.abs((bestValue ?? 0) - latestValue) < 1e-12;
+  const gap = overfitGap(latest, metric);
+  const familyScores = new Map<string, number>();
+  for (const run of runs) {
+    const value = metricValue(run.testMetrics, metric);
+    const family = familyOf(run.modelName);
+    const current = familyScores.get(family);
+    if (current === undefined || isBetter(value, current, optimize)) familyScores.set(family, value);
+  }
+  const rankedFamilies = [...familyScores.entries()].sort((a, b) =>
+    optimize === "minimize" ? a[1] - b[1] : b[1] - a[1],
+  );
+  return {
+    latestValue,
+    trainValue,
+    bestValue,
+    improved,
+    gap,
+    rankedFamilies,
+    commentary: [
+      `${latest.modelName} scored ${metric}=${latestValue.toFixed(4)} on the holdout set.`,
+      Number.isFinite(trainValue)
+        ? `Train ${metric}=${trainValue.toFixed(4)} (${gap > 0.18 ? "overfit risk" : "generalization looks acceptable"}).`
+        : "Train metrics unavailable.",
+      best
+        ? `Current leader is ${best.modelName} at ${metric}=${bestValue.toFixed(4)}.`
+        : "No leader yet.",
+      rankedFamilies[0] ? `Strongest family so far: ${rankedFamilies[0][0]}.` : "",
+    ]
+      .filter(Boolean)
+      .join(" "),
+  };
+}
+
+export function writeReport(
+  goal: string,
+  stats: DatasetStats,
+  plan: ExperimentPlan,
+  runs: Array<CompletedRun & { notes?: string | null }>,
+  best: CompletedRun | null,
+) {
+  const topCorr = stats.correlations?.slice(0, 3) ?? [];
+  const lessons = runs.slice(0, 8).map((run) => {
+    const value = metricValue(run.testMetrics, plan.primaryMetric);
+    return `${run.modelName} reached ${plan.primaryMetric}=${value.toFixed(4)} with ${JSON.stringify(run.hyperparameters)}.`;
+  });
+  const bestMetrics = best?.testMetrics ?? {};
+  return {
+    headline: best
+      ? `${best.modelName.replace(/_/g, " ")} is the best ${plan.taskType} model for this goal`
+      : "No successful model was selected",
+    narrative: `The agent interpreted the goal â€œ${goal}â€ as a ${plan.taskType} task that ${plan.optimize}s ${plan.primaryMetric}. After ${runs.length} live training runs on ${stats.rowCount} rows and ${stats.featureCount} features, ${
+      best
+        ? `${best.modelName} produced the strongest holdout ${plan.primaryMetric} of ${metricValue(best.testMetrics, plan.primaryMetric).toFixed(4)}.`
+        : "no model completed successfully."
+    }`,
+    bestModel: best?.modelName ?? "none",
+    bestParams: best?.hyperparameters ?? {},
+    bestMetrics,
+    whyItWon: best
+      ? `${best.modelName} beat the rest on unseen data. ${
+          familyOf(best.modelName) === "linear"
+            ? "The target appears close to linear in the strongest features, so regularized linear models generalized cleanly."
+            : "Non-linear structure in the features rewarded trees or boosting more than a pure linear baseline."
+        }`
+      : "The run did not produce a usable leader.",
+    datasetInsights: topCorr.length
+      ? `Strongest associations with ${stats.targetName}: ${topCorr
+          .map((item) => `${item.feature} (r=${item.corr.toFixed(2)})`)
+          .join(", ")}.`
+      : `Dataset has ${stats.rowCount} rows and target ${stats.targetName}.`,
+    experimentLessons: lessons,
+    recommendedNextSteps: [
+      "Hold out a fresh validation slice or add k-fold scoring around the winner.",
+      "If more compute is available, expand the winner's hyperparameter grid.",
+      "Inspect residuals or misclassified rows and engineer features from the top-correlated inputs.",
+    ],
+  };
+}
+
+===== FILE: src\lib\api.ts =====
+
+import type { DatasetRow, ExperimentRow, ProjectRow } from "@/db/schema";
+
+export function publicDataset(row: DatasetRow) {
+  return {
+    id: row.id,
+    name: row.name,
+    slug: row.slug,
+    source: row.source,
+    taskType: row.taskType,
+    targetColumn: row.targetColumn,
+    featureColumns: row.featureColumns,
+    rowCount: row.rowCount,
+    description: row.description,
+    stats: row.stats,
+    createdAt: row.createdAt.toISOString(),
+  };
+}
+
+export function publicProject(row: ProjectRow) {
+  return {
+    ...row,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
+export function publicExperiment(row: ExperimentRow) {
+  return {
+    ...row,
+    createdAt: row.createdAt.toISOString(),
+    completedAt: row.completedAt ? row.completedAt.toISOString() : null,
+  };
+}
+
+export function jsonError(message: string, status = 400) {
+  return Response.json({ error: message }, { status });
+}
+
+===== FILE: src\lib\domain.ts =====
+
+export type TaskType = "regression" | "classification";
+export type OptimizeDirection = "minimize" | "maximize";
+export type ProjectStatus = "draft" | "running" | "completed" | "failed";
+export type ExperimentStatus = "queued" | "running" | "completed" | "failed";
+
+export type AgentPhase =
+  | "idle"
+  | "analyzing_dataset"
+  | "planning"
+  | "selecting"
+  | "training"
+  | "evaluating"
+  | "analyzing"
+  | "deciding"
+  | "reporting"
+  | "completed"
+  | "failed";
+
+export type MetricName = "rmse" | "mae" | "r2" | "mape" | "accuracy" | "precision" | "recall" | "f1";
+
+export type ModelName =
+  | "linear_regression"
+  | "ridge"
+  | "lasso"
+  | "elastic_net"
+  | "knn"
+  | "decision_tree"
+  | "random_forest"
+  | "gradient_boosting"
+  | "logistic_regression";
+
+export type HyperParams = Record<string, string | number | boolean>;
+
+export interface DatasetStats {
+  rowCount: number;
+  featureCount: number;
+  targetName: string;
+  featureNames: string[];
+  missingCount: number;
+  targetMean?: number;
+  targetStd?: number;
+  targetMin?: number;
+  targetMax?: number;
+  classBalance?: Record<string, number>;
+  featureSummary: Array<{
+    name: string;
+    mean: number;
+    std: number;
+    min: number;
+    max: number;
+  }>;
+  correlations?: Array<{ feature: string; corr: number }>;
+}
+
+export interface DatasetPayload {
+  X: number[][];
+  y: number[];
+  featureNames: string[];
+  targetName: string;
+  classNames?: string[];
+}
+
+export interface Metrics {
+  rmse?: number;
+  mae?: number;
+  r2?: number;
+  mape?: number;
+  accuracy?: number;
+  precision?: number;
+  recall?: number;
+  f1?: number;
+}
+
+export interface PredictionPreview {
+  y: number[];
+  pred: number[];
+}
+
+export interface FeatureImportance {
+  name: string;
+  importance: number;
+}
+
+export interface ExperimentPlanItem {
+  model: ModelName;
+  params: HyperParams;
+  reason: string;
+}
+
+export interface ExperimentPlan {
+  taskType: TaskType;
+  primaryMetric: MetricName;
+  optimize: OptimizeDirection;
+  rationale: string;
+  minExperiments: number;
+  maxExperiments: number;
+  strategy: ExperimentPlanItem[];
+  adaptationPolicy: string;
+}
+
+export interface ExperimentConfig {
+  model: ModelName;
+  params: HyperParams;
+  reason: string;
+}
+
+export interface FinalReport {
+  headline: string;
+  narrative: string;
+  bestModel: string;
+  bestParams: HyperParams;
+  bestMetrics: Metrics;
+  whyItWon: string;
+  datasetInsights: string;
+  experimentLessons: string[];
+  recommendedNextSteps: string[];
+}
+
+export interface AgentLogEntry {
+  id: string;
+  projectId: string;
+  experimentId?: string | null;
+  node: string;
+  phase: AgentPhase;
+  level: "info" | "success" | "warn" | "error";
+  message: string;
+  payload?: unknown;
+  createdAt: string;
+}
+
+export const PHASE_ORDER: AgentPhase[] = [
+  "analyzing_dataset",
+  "planning",
+  "training",
+  "evaluating",
+  "analyzing",
+  "deciding",
+  "reporting",
+];
+
+export const PHASE_LABELS: Record<AgentPhase, string> = {
+  idle: "Idle",
+  analyzing_dataset: "Analyzing dataset",
+  planning: "Planning",
+  selecting: "Selecting experiment",
+  training: "Training",
+  evaluating: "Evaluating",
+  analyzing: "Analyzing",
+  deciding: "Deciding next step",
+  reporting: "Reporting",
+  completed: "Completed",
+  failed: "Failed",
+};
+
+===== FILE: src\lib\format.ts =====
+
+export function formatDuration(ms: number | null | undefined) {
+  if (!ms && ms !== 0) return "â€”";
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(2)}s`;
+}
+
+export function formatTime(iso: string) {
+  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+export function prettyModel(name: string) {
+  return name.replace(/_/g, " ").replace(/\b\w/g, (ch) => ch.toUpperCase());
+}
+
+export function prettyMetric(name: string) {
+  if (name === "r2") return "RÂ²";
+  if (name === "rmse") return "RMSE";
+  if (name === "mae") return "MAE";
+  if (name === "mape") return "MAPE";
+  if (name === "f1") return "F1";
+  return name[0]?.toUpperCase() + name.slice(1);
+}
+
+===== FILE: src\lib\id.ts =====
+
+export function createId(prefix?: string) {
+  const id = crypto.randomUUID();
+  return prefix ? `${prefix}_${id}` : id;
+}
+
+===== FILE: src\lib\logger.ts =====
+
+type Level = "debug" | "info" | "warn" | "error";
+
+function stamp(level: Level, scope: string, message: string, extra?: unknown) {
+  const line = `[${new Date().toISOString()}] [${level.toUpperCase()}] [${scope}] ${message}`;
+  if (extra !== undefined) {
+    console.log(line, extra);
+    return;
+  }
+  console.log(line);
+}
+
+export const logger = {
+  debug(scope: string, message: string, extra?: unknown) {
+    stamp("debug", scope, message, extra);
+  },
+  info(scope: string, message: string, extra?: unknown) {
+    stamp("info", scope, message, extra);
+  },
+  warn(scope: string, message: string, extra?: unknown) {
+    stamp("warn", scope, message, extra);
+  },
+  error(scope: string, message: string, extra?: unknown) {
+    stamp("error", scope, message, extra);
+  },
+};
+
+===== FILE: src\lib\ml\datasets.ts =====
+
+import type { DatasetPayload, TaskType } from "@/lib/domain";
+import { clip, mulberry32, normalSample } from "@/lib/ml/math";
+import { computeDatasetStats } from "@/lib/ml/preprocess";
+
+export interface BuiltinDataset {
+  slug: string;
+  name: string;
+  taskType: TaskType;
+  description: string;
+  targetColumn: string;
+  payload: DatasetPayload;
+}
+
+function californiaHousing(): DatasetPayload {
+  const rng = mulberry32(20260322);
+  const n = 1600;
+  const X: number[][] = [];
+  const y: number[] = [];
+  for (let i = 0; i < n; i += 1) {
+    const medInc = clip(Math.exp(1.15 + 0.45 * normalSample(rng)), 0.5, 15);
+    const houseAge = clip(15 + 14 * normalSample(rng), 1, 52);
+    const aveRooms = clip(5.4 + 1.1 * normalSample(rng), 2.2, 12);
+    const aveBedrms = clip(1.05 + 0.18 * normalSample(rng), 0.6, 3.2);
+    const population = clip(Math.exp(6.8 + 0.7 * normalSample(rng)), 80, 9000);
+    const aveOccup = clip(2.9 + 0.7 * normalSample(rng), 1.1, 8);
+    const latitude = 32.6 + rng() * 9.2;
+    const longitude = -124.2 + rng() * 10.1;
+
+    const sf = Math.exp(-((latitude - 37.8) ** 2) / 1.4 - (longitude + 122.3) ** 2 / 1.6);
+    const la = Math.exp(-((latitude - 34.05) ** 2) / 1.6 - (longitude + 118.25) ** 2 / 1.8);
+    const coastal = clip(0.15 + 1.7 * sf + 1.4 * la + 0.08 * (-118 - longitude) / 6, 0, 2.4);
+
+    const value =
+      0.72 * medInc +
+      0.18 * aveRooms +
+      0.08 * (houseAge / 20) * coastal -
+      0.22 * aveOccup -
+      0.05 * aveBedrms +
+      1.15 * coastal +
+      0.00001 * Math.min(population, 4000) +
+      0.28 * normalSample(rng);
+    X.push([medInc, houseAge, aveRooms, aveBedrms, population, aveOccup, latitude, longitude]);
+    y.push(clip(value, 0.15, 5));
+  }
+  return {
+    X,
+    y,
+    featureNames: [
+      "MedInc",
+      "HouseAge",
+      "AveRooms",
+      "AveBedrms",
+      "Population",
+      "AveOccup",
+      "Latitude",
+      "Longitude",
+    ],
+    targetName: "MedHouseVal",
+  };
+}
+
+function diabetesProgression(): DatasetPayload {
+  const rng = mulberry32(91);
+  const n = 900;
+  const X: number[][] = [];
+  const y: number[] = [];
+  for (let i = 0; i < n; i += 1) {
+    const age = clip(48 + 12 * normalSample(rng), 20, 80);
+    const sex = rng() > 0.5 ? 1 : 0;
+    const bmi = clip(26 + 5 * normalSample(rng), 16, 48);
+    const bp = clip(90 + 14 * normalSample(rng), 60, 140);
+    const s1 = clip(180 + 30 * normalSample(rng), 80, 300);
+    const s2 = clip(120 + 25 * normalSample(rng), 40, 240);
+    const s3 = clip(50 + 12 * normalSample(rng), 15, 110);
+    const s4 = clip(4.5 + 1.3 * normalSample(rng), 1, 10);
+    const s5 = clip(4.6 + 0.5 * normalSample(rng), 3, 6.5);
+    const s6 = clip(91 + 11 * normalSample(rng), 50, 140);
+    const target =
+      1.8 * (bmi - 25) +
+      0.7 * (bp - 90) +
+      8 * (s5 - 4.5) -
+      0.35 * s3 +
+      4 * sex +
+      0.08 * age +
+      6 * normalSample(rng) +
+      140;
+    X.push([age, sex, bmi, bp, s1, s2, s3, s4, s5, s6]);
+    y.push(clip(target, 40, 320));
+  }
+  return {
+    X,
+    y,
+    featureNames: ["age", "sex", "bmi", "bp", "s1", "s2", "s3", "s4", "s5", "s6"],
+    targetName: "progression",
+  };
+}
+
+function wineQuality(): DatasetPayload {
+  const rng = mulberry32(17);
+  const n = 1200;
+  const X: number[][] = [];
+  const y: number[] = [];
+  for (let i = 0; i < n; i += 1) {
+    const fa = clip(8.3 + 1.7 * normalSample(rng), 4.5, 15);
+    const va = clip(0.53 + 0.18 * normalSample(rng), 0.12, 1.4);
+    const ca = clip(0.27 + 0.18 * normalSample(rng), 0, 1);
+    const sugar = clip(2.5 + 1.4 * Math.abs(normalSample(rng)), 0.8, 14);
+    const chlorides = clip(0.087 + 0.04 * normalSample(rng), 0.02, 0.4);
+    const fso2 = clip(16 + 10 * Math.abs(normalSample(rng)), 2, 70);
+    const tso2 = clip(46 + 28 * Math.abs(normalSample(rng)), 8, 220);
+    const density = clip(0.9967 + 0.002 * normalSample(rng), 0.99, 1.004);
+    const ph = clip(3.31 + 0.15 * normalSample(rng), 2.8, 4);
+    const sulphates = clip(0.66 + 0.17 * normalSample(rng), 0.3, 1.8);
+    const alcohol = clip(10.4 + 1.1 * normalSample(rng), 8.2, 14.5);
+    const quality =
+      3.1 +
+      0.32 * alcohol -
+      1.7 * va +
+      0.9 * sulphates +
+      0.15 * ca -
+      1.8 * chlorides -
+      8 * (density - 0.996) +
+      0.18 * normalSample(rng);
+    X.push([fa, va, ca, sugar, chlorides, fso2, tso2, density, ph, sulphates, alcohol]);
+    y.push(clip(quality, 3, 8));
+  }
+  return {
+    X,
+    y,
+    featureNames: [
+      "fixed_acidity",
+      "volatile_acidity",
+      "citric_acid",
+      "residual_sugar",
+      "chlorides",
+      "free_sulfur_dioxide",
+      "total_sulfur_dioxide",
+      "density",
+      "pH",
+      "sulphates",
+      "alcohol",
+    ],
+    targetName: "quality",
+  };
+}
+
+function irisFlowers(): DatasetPayload {
+  const rng = mulberry32(3);
+  const centers = [
+    [5.0, 3.4, 1.5, 0.2],
+    [5.9, 2.8, 4.3, 1.3],
+    [6.6, 3.0, 5.5, 2.0],
+  ];
+  const X: number[][] = [];
+  const y: number[] = [];
+  for (let c = 0; c < 3; c += 1) {
+    for (let i = 0; i < 120; i += 1) {
+      X.push(centers[c].map((value, j) => value + (j < 2 ? 0.28 : 0.22) * normalSample(rng)));
+      y.push(c);
+    }
+  }
+  return {
+    X,
+    y,
+    featureNames: ["sepal_length", "sepal_width", "petal_length", "petal_width"],
+    targetName: "species",
+    classNames: ["setosa", "versicolor", "virginica"],
+  };
+}
+
+function incomeClass(): DatasetPayload {
+  const rng = mulberry32(44);
+  const n = 1400;
+  const X: number[][] = [];
+  const y: number[] = [];
+  for (let i = 0; i < n; i += 1) {
+    const age = clip(38 + 12 * normalSample(rng), 18, 75);
+    const education = clip(10 + 3.2 * normalSample(rng), 4, 16);
+    const hours = clip(40 + 9 * normalSample(rng), 10, 80);
+    const capital = clip(Math.exp(2.2 + 1.8 * normalSample(rng)) - 8, 0, 20000);
+    const experience = clip(age - education - 6 + 2 * normalSample(rng), 0, 50);
+    const score =
+      0.08 * (age - 30) +
+      0.55 * (education - 10) +
+      0.04 * (hours - 40) +
+      0.00012 * capital +
+      0.05 * experience +
+      0.7 * normalSample(rng);
+    X.push([age, education, hours, capital, experience]);
+    y.push(score > 0.6 ? 1 : 0);
+  }
+  return {
+    X,
+    y,
+    featureNames: ["age", "education_years", "hours_per_week", "capital_gain", "experience"],
+    targetName: "high_income",
+    classNames: ["<=50K", ">50K"],
+  };
+}
+
+export function builtinDatasets(): BuiltinDataset[] {
+  const defs: Array<Omit<BuiltinDataset, "payload"> & { build: () => DatasetPayload }> = [
+    {
+      slug: "california-housing",
+      name: "California Housing",
+      taskType: "regression",
+      targetColumn: "MedHouseVal",
+      description:
+        "District-level California housing data. Predict median house value from income, occupancy, and geography.",
+      build: californiaHousing,
+    },
+    {
+      slug: "diabetes",
+      name: "Diabetes Progression",
+      taskType: "regression",
+      targetColumn: "progression",
+      description: "Clinical measurements used to predict a quantitative disease progression score.",
+      build: diabetesProgression,
+    },
+    {
+      slug: "wine-quality",
+      name: "Wine Quality",
+      taskType: "regression",
+      targetColumn: "quality",
+      description: "Physicochemical wine tests used to estimate expert quality scores.",
+      build: wineQuality,
+    },
+    {
+      slug: "iris",
+      name: "Iris Flowers",
+      taskType: "classification",
+      targetColumn: "species",
+      description: "Classic 3-class flower dataset for quick classification experiments.",
+      build: irisFlowers,
+    },
+    {
+      slug: "income",
+      name: "Income Bracket",
+      taskType: "classification",
+      targetColumn: "high_income",
+      description: "Tabular census-style features for predicting whether income exceeds $50K.",
+      build: incomeClass,
+    },
+  ];
+
+  return defs.map((def) => ({
+    slug: def.slug,
+    name: def.name,
+    taskType: def.taskType,
+    targetColumn: def.targetColumn,
+    description: def.description,
+    payload: def.build(),
+  }));
+}
+
+export function describeBuiltin(dataset: BuiltinDataset) {
+  return {
+    ...dataset,
+    stats: computeDatasetStats(dataset.payload, dataset.taskType),
+    featureColumns: dataset.payload.featureNames,
+    rowCount: dataset.payload.X.length,
+  };
+}
+
+===== FILE: src\lib\ml\engine.ts =====
+
+import type { FeatureImportance, HyperParams, Metrics, ModelName, TaskType } from "@/lib/domain";
+import { evaluatePredictions } from "@/lib/ml/metrics";
+import { predictModel, trainModel } from "@/lib/ml/models";
+import { trainTestSplit } from "@/lib/ml/preprocess";
+import { validateExperimentConfig } from "@/lib/ml/registry";
+
+export interface EngineResult {
+  model: ModelName;
+  params: HyperParams;
+  trainMetrics: Metrics;
+  testMetrics: Metrics;
+  durationMs: number;
+  featureImportance: FeatureImportance[];
+  preview: { y: number[]; pred: number[] };
+  coefficients: Record<string, number> | null;
+}
+
+export function runSafeExperiment(input: {
+  model: string;
+  params: HyperParams;
+  task: TaskType;
+  X: number[][];
+  y: number[];
+  featureNames: string[];
+  seed?: number;
+}): EngineResult {
+  const validated = validateExperimentConfig(input.model, input.params, input.task);
+  const split = trainTestSplit(input.X, input.y, 0.2, input.seed ?? 42);
+  const started = Date.now();
+  const trained = trainModel({
+    model: validated.model,
+    task: input.task,
+    X: split.xTrain,
+    y: split.yTrain,
+    params: validated.params,
+  });
+  const trainPred = predictModel(trained, split.xTrain);
+  const testPred = predictModel(trained, split.xTest);
+  const durationMs = Date.now() - started;
+
+  const importanceSource = trained.importances ?? [];
+  const total = importanceSource.reduce((sum, value) => sum + Math.abs(value), 0) || 1;
+  const featureImportance = input.featureNames.map((name, i) => ({
+    name,
+    importance: Math.abs(importanceSource[i] ?? 0) / total,
+  }));
+
+  let coefficients: Record<string, number> | null = null;
+  if (trained.weights && trained.intercept !== undefined) {
+    coefficients = { intercept: trained.intercept };
+    input.featureNames.forEach((name, i) => {
+      coefficients![name] = trained.weights?.[i] ?? 0;
+    });
+  }
+
+  const previewCount = Math.min(80, split.yTest.length);
+  return {
+    model: validated.model,
+    params: validated.params,
+    trainMetrics: evaluatePredictions(input.task, split.yTrain, trainPred),
+    testMetrics: evaluatePredictions(input.task, split.yTest, testPred),
+    durationMs,
+    featureImportance,
+    preview: {
+      y: split.yTest.slice(0, previewCount),
+      pred: testPred.slice(0, previewCount),
+    },
+    coefficients,
+  };
+}
+
+===== FILE: src\lib\ml\math.ts =====
+
+export function mulberry32(seed: number) {
+  let a = seed >>> 0;
+  return function next() {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+export function seededInt(rng: () => number, min: number, max: number) {
+  return Math.floor(rng() * (max - min + 1)) + min;
+}
+
+export function shuffleInPlace<T>(items: T[], rng: () => number) {
+  for (let i = items.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(rng() * (i + 1));
+    const tmp = items[i];
+    items[i] = items[j];
+    items[j] = tmp;
+  }
+  return items;
+}
+
+export function mean(values: number[]) {
+  if (values.length === 0) return 0;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+export function variance(values: number[]) {
+  if (values.length === 0) return 0;
+  const mu = mean(values);
+  return values.reduce((sum, value) => sum + (value - mu) ** 2, 0) / values.length;
+}
+
+export function std(values: number[]) {
+  return Math.sqrt(variance(values));
+}
+
+export function median(values: number[]) {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
+
+export function pearson(x: number[], y: number[]) {
+  const n = Math.min(x.length, y.length);
+  if (n === 0) return 0;
+  const mx = mean(x.slice(0, n));
+  const my = mean(y.slice(0, n));
+  let num = 0;
+  let dx = 0;
+  let dy = 0;
+  for (let i = 0; i < n; i += 1) {
+    const vx = x[i] - mx;
+    const vy = y[i] - my;
+    num += vx * vy;
+    dx += vx * vx;
+    dy += vy * vy;
+  }
+  const den = Math.sqrt(dx * dy);
+  return den === 0 ? 0 : num / den;
+}
+
+export function clip(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+export function argmax(values: number[]) {
+  let best = 0;
+  for (let i = 1; i < values.length; i += 1) {
+    if (values[i] > values[best]) best = i;
+  }
+  return best;
+}
+
+export function uniqueSorted(values: number[]) {
+  return [...new Set(values)].sort((a, b) => a - b);
+}
+
+export function solveLinearSystem(rawA: number[][], rawB: number[]) {
+  const n = rawA.length;
+  const M = rawA.map((row, i) => {
+    if (row.length !== n) {
+      throw new Error("Matrix must be square");
+    }
+    return [...row, rawB[i]];
+  });
+
+  for (let k = 0; k < n; k += 1) {
+    let pivotRow = k;
+    let pivotAbs = Math.abs(M[k][k]);
+    for (let i = k + 1; i < n; i += 1) {
+      const candidate = Math.abs(M[i][k]);
+      if (candidate > pivotAbs) {
+        pivotAbs = candidate;
+        pivotRow = i;
+      }
+    }
+    if (pivotAbs < 1e-12) {
+      M[k][k] += 1e-6;
+    } else if (pivotRow !== k) {
+      const swap = M[k];
+      M[k] = M[pivotRow];
+      M[pivotRow] = swap;
+    }
+    const pivot = M[k][k] === 0 ? 1e-6 : M[k][k];
+    for (let i = k + 1; i < n; i += 1) {
+      const factor = M[i][k] / pivot;
+      for (let j = k; j <= n; j += 1) {
+        M[i][j] -= factor * M[k][j];
+      }
+    }
+  }
+
+  const x = Array.from({ length: n }, () => 0);
+  for (let i = n - 1; i >= 0; i -= 1) {
+    let sum = M[i][n];
+    for (let j = i + 1; j < n; j += 1) {
+      sum -= M[i][j] * x[j];
+    }
+    const diag = Math.abs(M[i][i]) < 1e-12 ? 1e-12 : M[i][i];
+    x[i] = sum / diag;
+  }
+  return x;
+}
+
+export function addIntercept(X: number[][]) {
+  return X.map((row) => [1, ...row]);
+}
+
+export function transpose(A: number[][]) {
+  if (A.length === 0) return [];
+  return A[0].map((_, j) => A.map((row) => row[j]));
+}
+
+export function matMul(A: number[][], B: number[][]) {
+  const n = A.length;
+  const m = B[0]?.length ?? 0;
+  const p = B.length;
+  const out: number[][] = Array.from({ length: n }, () => Array.from({ length: m }, () => 0));
+  for (let i = 0; i < n; i += 1) {
+    for (let k = 0; k < p; k += 1) {
+      const aik = A[i][k];
+      for (let j = 0; j < m; j += 1) {
+        out[i][j] += aik * B[k][j];
+      }
+    }
+  }
+  return out;
+}
+
+export function matVec(A: number[][], v: number[]) {
+  return A.map((row) => row.reduce((sum, value, i) => sum + value * v[i], 0));
+}
+
+export function identity(n: number) {
+  return Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) => (i === j ? 1 : 0)));
+}
+
+export function normalSample(rng: () => number) {
+  const u = Math.max(rng(), 1e-9);
+  const v = Math.max(rng(), 1e-9);
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+export function choice<T>(items: T[], rng: () => number) {
+  return items[Math.floor(rng() * items.length)];
+}
+
+export function sampleWithoutReplacement<T>(items: T[], k: number, rng: () => number) {
+  const copy = [...items];
+  shuffleInPlace(copy, rng);
+  return copy.slice(0, Math.min(k, copy.length));
+}
+
+===== FILE: src\lib\ml\metrics.ts =====
+
+import type { Metrics, TaskType } from "@/lib/domain";
+import { mean } from "@/lib/ml/math";
+
+export function rmse(y: number[], pred: number[]) {
+  const n = y.length;
+  if (n === 0) return 0;
+  let sum = 0;
+  for (let i = 0; i < n; i += 1) sum += (y[i] - pred[i]) ** 2;
+  return Math.sqrt(sum / n);
+}
+
+export function mae(y: number[], pred: number[]) {
+  const n = y.length;
+  if (n === 0) return 0;
+  let sum = 0;
+  for (let i = 0; i < n; i += 1) sum += Math.abs(y[i] - pred[i]);
+  return sum / n;
+}
+
+export function r2Score(y: number[], pred: number[]) {
+  const n = y.length;
+  if (n === 0) return 0;
+  const yMean = mean(y);
+  let ssRes = 0;
+  let ssTot = 0;
+  for (let i = 0; i < n; i += 1) {
+    ssRes += (y[i] - pred[i]) ** 2;
+    ssTot += (y[i] - yMean) ** 2;
+  }
+  if (ssTot === 0) return 0;
+  return 1 - ssRes / ssTot;
+}
+
+export function mape(y: number[], pred: number[]) {
+  const n = y.length;
+  if (n === 0) return 0;
+  let sum = 0;
+  let count = 0;
+  for (let i = 0; i < n; i += 1) {
+    if (Math.abs(y[i]) < 1e-9) continue;
+    sum += Math.abs((y[i] - pred[i]) / y[i]);
+    count += 1;
+  }
+  return count === 0 ? 0 : (sum / count) * 100;
+}
+
+function classCounts(y: number[], pred: number[]) {
+  const labels = [...new Set([...y, ...pred])];
+  let tp = 0;
+  let fp = 0;
+  let fn = 0;
+  let correct = 0;
+  for (const label of labels) {
+    let ltp = 0;
+    let lfp = 0;
+    let lfn = 0;
+    for (let i = 0; i < y.length; i += 1) {
+      if (pred[i] === label && y[i] === label) ltp += 1;
+      if (pred[i] === label && y[i] !== label) lfp += 1;
+      if (pred[i] !== label && y[i] === label) lfn += 1;
+      if (label === labels[0] && pred[i] === y[i]) correct += 1;
+    }
+    tp += ltp;
+    fp += lfp;
+    fn += lfn;
+  }
+  return { tp, fp, fn, correct, n: y.length };
+}
+
+export function classificationMetrics(y: number[], pred: number[]): Metrics {
+  const { tp, fp, fn, correct, n } = classCounts(y, pred);
+  const precision = tp + fp === 0 ? 0 : tp / (tp + fp);
+  const recall = tp + fn === 0 ? 0 : tp / (tp + fn);
+  const f1 = precision + recall === 0 ? 0 : (2 * precision * recall) / (precision + recall);
+  return {
+    accuracy: n === 0 ? 0 : correct / n,
+    precision,
+    recall,
+    f1,
+  };
+}
+
+export function regressionMetrics(y: number[], pred: number[]): Metrics {
+  return {
+    rmse: rmse(y, pred),
+    mae: mae(y, pred),
+    r2: r2Score(y, pred),
+    mape: mape(y, pred),
+  };
+}
+
+export function evaluatePredictions(task: TaskType, y: number[], pred: number[]): Metrics {
+  return task === "classification" ? classificationMetrics(y, pred) : regressionMetrics(y, pred);
+}
+
+export function metricValue(metrics: Metrics | null | undefined, name: string) {
+  if (!metrics) return Number.NaN;
+  const value = metrics[name as keyof Metrics];
+  return typeof value === "number" ? value : Number.NaN;
+}
+
+export function isBetter(
+  candidate: number,
+  incumbent: number,
+  optimize: "minimize" | "maximize",
+) {
+  if (Number.isNaN(candidate)) return false;
+  if (Number.isNaN(incumbent)) return true;
+  return optimize === "minimize" ? candidate < incumbent : candidate > incumbent;
+}
+
+export function formatMetric(name: string, value: number | undefined | null) {
+  if (value === undefined || value === null || Number.isNaN(value)) return "â€”";
+  if (name === "accuracy" || name === "precision" || name === "recall" || name === "f1" || name === "r2") {
+    return value.toFixed(3);
+  }
+  if (Math.abs(value) >= 100) return value.toFixed(1);
+  if (Math.abs(value) >= 10) return value.toFixed(2);
+  return value.toFixed(4);
+}
+
+===== FILE: src\lib\ml\models.ts =====
+
+import type { ModelName, TaskType } from "@/lib/domain";
+import {
+  addIntercept,
+  argmax,
+  clip,
+  matMul,
+  matVec,
+  mean,
+  mulberry32,
+  solveLinearSystem,
+  transpose,
+} from "@/lib/ml/math";
+import { bootstrapIndices, fitTree, predictTree, predictTreeMany, type TreeNode } from "@/lib/ml/tree";
+import { applyScaler, fitScaler, type Scaler } from "@/lib/ml/preprocess";
+
+export interface TrainedModel {
+  model: ModelName;
+  task: TaskType;
+  scaler?: Scaler;
+  weights?: number[];
+  intercept?: number;
+  trees?: TreeNode[];
+  learningRate?: number;
+  init?: number;
+  knnX?: number[][];
+  knnY?: number[];
+  k?: number;
+  weighted?: boolean;
+  importances?: number[];
+}
+
+export interface TrainInput {
+  model: ModelName;
+  task: TaskType;
+  X: number[][];
+  y: number[];
+  params: Record<string, number | string | boolean>;
+}
+
+function num(params: Record<string, number | string | boolean>, key: string, fallback: number) {
+  const value = params[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function bool(params: Record<string, number | string | boolean>, key: string, fallback: boolean) {
+  const value = params[key];
+  return typeof value === "boolean" ? value : fallback;
+}
+
+function str(params: Record<string, number | string | boolean>, key: string, fallback: string) {
+  const value = params[key];
+  return typeof value === "string" ? value : fallback;
+}
+
+function maxFeaturesOf(params: Record<string, number | string | boolean>) {
+  const raw = params.maxFeatures;
+  if (raw === "sqrt" || raw === "log2" || raw === "all") return raw;
+  if (typeof raw === "number") return raw;
+  return "sqrt";
+}
+
+function fitLinear(X: number[][], y: number[], alpha: number, l1Ratio = 0, maxIter = 80) {
+  const scaler = fitScaler(X);
+  const Xs = applyScaler(X, scaler);
+  const n = Xs.length;
+  const d = Xs[0]?.length ?? 0;
+
+  if (l1Ratio === 0) {
+    const Xi = addIntercept(Xs);
+    const Xt = transpose(Xi);
+    const XtX = matMul(Xt, Xi);
+    for (let i = 1; i < XtX.length; i += 1) XtX[i][i] += alpha;
+    const Xty = matVec(Xt, y);
+    const beta = solveLinearSystem(XtX, Xty);
+    return {
+      scaler,
+      intercept: beta[0],
+      weights: beta.slice(1),
+      importances: beta.slice(1).map((w) => Math.abs(w)),
+    };
+  }
+
+  let weights = Array.from({ length: d }, () => 0);
+  let intercept = mean(y);
+  const l1 = alpha * l1Ratio;
+  const l2 = alpha * (1 - l1Ratio);
+
+  for (let iter = 0; iter < maxIter; iter += 1) {
+    intercept = mean(y.map((yi, i) => yi - Xs[i].reduce((s, xij, j) => s + xij * weights[j], 0)));
+    for (let j = 0; j < d; j += 1) {
+      let rho = 0;
+      let norm = 0;
+      for (let i = 0; i < n; i += 1) {
+        let pred = intercept;
+        for (let k = 0; k < d; k += 1) {
+          if (k !== j) pred += Xs[i][k] * weights[k];
+        }
+        rho += Xs[i][j] * (y[i] - pred);
+        norm += Xs[i][j] * Xs[i][j];
+      }
+      const denom = norm + n * l2;
+      if (denom === 0) {
+        weights[j] = 0;
+        continue;
+      }
+      weights[j] = softThreshold(rho / n, l1) / (denom / n);
+    }
+  }
+
+  return {
+    scaler,
+    intercept,
+    weights,
+    importances: weights.map((w) => Math.abs(w)),
+  };
+}
+
+function softThreshold(value: number, lambda: number) {
+  if (value > lambda) return value - lambda;
+  if (value < -lambda) return value + lambda;
+  return 0;
+}
+
+function predictLinear(row: number[], intercept: number, weights: number[]) {
+  return intercept + row.reduce((sum, value, i) => sum + value * (weights[i] ?? 0), 0);
+}
+
+function sigmoid(z: number) {
+  const x = clip(z, -30, 30);
+  return 1 / (1 + Math.exp(-x));
+}
+
+function fitLogistic(X: number[][], y: number[], lr: number, epochs: number, l2: number) {
+  const scaler = fitScaler(X);
+  const Xs = applyScaler(X, scaler);
+  const classes = [...new Set(y)].sort((a, b) => a - b);
+  const n = Xs.length;
+  const d = Xs[0]?.length ?? 0;
+  const models = classes.map(() => ({
+    intercept: 0,
+    weights: Array.from({ length: d }, () => 0),
+  }));
+
+  for (let epoch = 0; epoch < epochs; epoch += 1) {
+    for (let c = 0; c < classes.length; c += 1) {
+      const model = models[c];
+      let gInt = 0;
+      const gW = Array.from({ length: d }, () => 0);
+      for (let i = 0; i < n; i += 1) {
+        const target = y[i] === classes[c] ? 1 : 0;
+        const z = predictLinear(Xs[i], model.intercept, model.weights);
+        const err = sigmoid(z) - target;
+        gInt += err;
+        for (let j = 0; j < d; j += 1) gW[j] += err * Xs[i][j];
+      }
+      model.intercept -= (lr * gInt) / n;
+      for (let j = 0; j < d; j += 1) {
+        model.weights[j] -= (lr * (gW[j] / n + l2 * model.weights[j]));
+      }
+    }
+  }
+
+  const importances = Array.from({ length: d }, () => 0);
+  for (const model of models) {
+    model.weights.forEach((w, j) => {
+      importances[j] += Math.abs(w);
+    });
+  }
+
+  return {
+    scaler,
+    classes,
+    models,
+    importances,
+  };
+}
+
+function predictLogisticRow(
+  row: number[],
+  classes: number[],
+  models: Array<{ intercept: number; weights: number[] }>,
+) {
+  const scores = models.map((model) => sigmoid(predictLinear(row, model.intercept, model.weights)));
+  return classes[argmax(scores)] ?? 0;
+}
+
+function fitKnn(X: number[][], y: number[], k: number, weighted: boolean) {
+  const scaler = fitScaler(X);
+  const Xs = applyScaler(X, scaler);
+  return { scaler, knnX: Xs, knnY: y, k, weighted };
+}
+
+function predictKnn(
+  row: number[],
+  knnX: number[][],
+  knnY: number[],
+  k: number,
+  weighted: boolean,
+  task: TaskType,
+) {
+  const distances = knnX.map((other, i) => {
+    let dist = 0;
+    for (let j = 0; j < other.length; j += 1) {
+      const d = other[j] - row[j];
+      dist += d * d;
+    }
+    return { i, dist: Math.sqrt(dist) };
+  });
+  distances.sort((a, b) => a.dist - b.dist);
+  const neighbors = distances.slice(0, Math.max(1, Math.min(k, distances.length)));
+  if (task === "classification") {
+    const votes = new Map<number, number>();
+    for (const neighbor of neighbors) {
+      const weight = weighted ? 1 / (neighbor.dist + 1e-6) : 1;
+      votes.set(knnY[neighbor.i], (votes.get(knnY[neighbor.i]) ?? 0) + weight);
+    }
+    let best = knnY[neighbors[0].i];
+    let bestVote = -1;
+    for (const [label, vote] of votes) {
+      if (vote > bestVote) {
+        best = label;
+        bestVote = vote;
+      }
+    }
+    return best;
+  }
+  let num = 0;
+  let den = 0;
+  for (const neighbor of neighbors) {
+    const weight = weighted ? 1 / (neighbor.dist + 1e-6) : 1;
+    num += weight * knnY[neighbor.i];
+    den += weight;
+  }
+  return den === 0 ? 0 : num / den;
+}
+
+export function trainModel(input: TrainInput): TrainedModel {
+  const { model, task, X, y, params } = input;
+  const seed = num(params, "randomState", 42);
+
+  if (model === "linear_regression" || model === "ridge" || model === "lasso" || model === "elastic_net") {
+    const alpha =
+      model === "linear_regression" ? 0 : Math.max(0, num(params, "alpha", model === "ridge" ? 1 : 0.1));
+    const l1Ratio =
+      model === "lasso" ? 1 : model === "elastic_net" ? clip(num(params, "l1Ratio", 0.5), 0, 1) : 0;
+    const fitted = fitLinear(X, y, alpha, l1Ratio);
+    return {
+      model,
+      task,
+      scaler: fitted.scaler,
+      intercept: fitted.intercept,
+      weights: fitted.weights,
+      importances: fitted.importances,
+    };
+  }
+
+  if (model === "logistic_regression") {
+    const fitted = fitLogistic(X, y, num(params, "learningRate", 0.2), num(params, "epochs", 180), num(params, "l2", 0.01));
+    return {
+      model,
+      task,
+      scaler: fitted.scaler,
+      intercept: 0,
+      weights: fitted.models[0]?.weights,
+      importances: fitted.importances,
+      trees: undefined,
+      knnY: fitted.classes,
+      knnX: fitted.models.map((m) => [m.intercept, ...m.weights]),
+    };
+  }
+
+  if (model === "knn") {
+    const fitted = fitKnn(X, y, Math.max(1, Math.round(num(params, "k", 5))), bool(params, "weighted", true));
+    return {
+      model,
+      task,
+      scaler: fitted.scaler,
+      knnX: fitted.knnX,
+      knnY: fitted.knnY,
+      k: fitted.k,
+      weighted: fitted.weighted,
+    };
+  }
+
+  if (model === "decision_tree") {
+    const fitted = fitTree(X, y, {
+      task,
+      maxDepth: Math.round(num(params, "maxDepth", 6)),
+      minSamplesSplit: Math.round(num(params, "minSamplesSplit", 8)),
+      minSamplesLeaf: Math.round(num(params, "minSamplesLeaf", 3)),
+      maxFeatures: "all",
+      seed,
+    });
+    return { model, task, trees: [fitted.tree], importances: fitted.importances };
+  }
+
+  if (model === "random_forest") {
+    const nEstimators = Math.max(5, Math.round(num(params, "nEstimators", 25)));
+    const rng = mulberry32(seed);
+    const trees: TreeNode[] = [];
+    const importances = Array.from({ length: X[0]?.length ?? 0 }, () => 0);
+    for (let t = 0; t < nEstimators; t += 1) {
+      const bag = bootstrapIndices(X.length, rng);
+      const xb = bag.map((i) => X[i]);
+      const yb = bag.map((i) => y[i]);
+      const fitted = fitTree(xb, yb, {
+        task,
+        maxDepth: Math.round(num(params, "maxDepth", 8)),
+        minSamplesSplit: Math.round(num(params, "minSamplesSplit", 6)),
+        minSamplesLeaf: Math.round(num(params, "minSamplesLeaf", 2)),
+        maxFeatures: maxFeaturesOf(params),
+        seed: Math.floor(rng() * 1e9),
+      });
+      trees.push(fitted.tree);
+      fitted.importances.forEach((value, i) => {
+        importances[i] += value;
+      });
+    }
+    return { model, task, trees, importances };
+  }
+
+  if (model === "gradient_boosting") {
+    const nEstimators = Math.max(5, Math.round(num(params, "nEstimators", 30)));
+    const learningRate = num(params, "learningRate", 0.1);
+    const subsample = clip(num(params, "subsample", 1), 0.5, 1);
+    const rng = mulberry32(seed);
+    const init = task === "classification" ? mean(y) : mean(y);
+    let residual = y.map((value) => value - init);
+    const trees: TreeNode[] = [];
+    const importances = Array.from({ length: X[0]?.length ?? 0 }, () => 0);
+    for (let t = 0; t < nEstimators; t += 1) {
+      const count = Math.max(8, Math.floor(X.length * subsample));
+      const idx = Array.from({ length: X.length }, (_, i) => i);
+      const selected: number[] = [];
+      for (let i = 0; i < count; i += 1) selected.push(idx[Math.floor(rng() * idx.length)]);
+      const xb = selected.map((i) => X[i]);
+      const yb = selected.map((i) => residual[i]);
+      const fitted = fitTree(xb, yb, {
+        task: "regression",
+        maxDepth: Math.round(num(params, "maxDepth", 3)),
+        minSamplesSplit: Math.round(num(params, "minSamplesSplit", 8)),
+        minSamplesLeaf: Math.round(num(params, "minSamplesLeaf", 3)),
+        maxFeatures: str(params, "maxFeatures", "all") as "all",
+        seed: Math.floor(rng() * 1e9),
+      });
+      trees.push(fitted.tree);
+      fitted.importances.forEach((value, i) => {
+        importances[i] += value;
+      });
+      const pred = predictTreeMany(fitted.tree, X);
+      residual = residual.map((value, i) => value - learningRate * pred[i]);
+    }
+    return { model, task, trees, learningRate, init, importances };
+  }
+
+  throw new Error(`Unsupported model: ${model}`);
+}
+
+export function predictModel(trained: TrainedModel, X: number[][]) {
+  const scaled = trained.scaler ? applyScaler(X, trained.scaler) : X;
+
+  if (
+    trained.model === "linear_regression" ||
+    trained.model === "ridge" ||
+    trained.model === "lasso" ||
+    trained.model === "elastic_net"
+  ) {
+    return scaled.map((row) => predictLinear(row, trained.intercept ?? 0, trained.weights ?? []));
+  }
+
+  if (trained.model === "logistic_regression") {
+    const classes = trained.knnY ?? [0, 1];
+    const packed = trained.knnX ?? [];
+    const models = packed.map((row) => ({ intercept: row[0] ?? 0, weights: row.slice(1) }));
+    return scaled.map((row) => predictLogisticRow(row, classes, models));
+  }
+
+  if (trained.model === "knn") {
+    return scaled.map((row) =>
+      predictKnn(row, trained.knnX ?? [], trained.knnY ?? [], trained.k ?? 5, trained.weighted ?? true, trained.task),
+    );
+  }
+
+  if (trained.model === "decision_tree") {
+    const tree = trained.trees?.[0];
+    if (!tree) return X.map(() => 0);
+    const pred = predictTreeMany(tree, X);
+    return trained.task === "classification" ? pred.map((value) => Math.round(value)) : pred;
+  }
+
+  if (trained.model === "random_forest") {
+    const trees = trained.trees ?? [];
+    return X.map((row) => {
+      const votes = trees.map((tree) => predictTree(tree, row));
+      if (trained.task === "classification") {
+        const counts = new Map<number, number>();
+        for (const vote of votes) counts.set(Math.round(vote), (counts.get(Math.round(vote)) ?? 0) + 1);
+        let best = votes[0] ?? 0;
+        let bestCount = -1;
+        for (const [label, count] of counts) {
+          if (count > bestCount) {
+            best = label;
+            bestCount = count;
+          }
+        }
+        return best;
+      }
+      return mean(votes);
+    });
+  }
+
+  if (trained.model === "gradient_boosting") {
+    const trees = trained.trees ?? [];
+    const lr = trained.learningRate ?? 0.1;
+    const init = trained.init ?? 0;
+    return X.map((row) => {
+      let value = init;
+      for (const tree of trees) value += lr * predictTree(tree, row);
+      return trained.task === "classification" ? Math.round(clip(value, 0, 10)) : value;
+    });
+  }
+
+  return X.map(() => 0);
+}
+
+===== FILE: src\lib\ml\preprocess.ts =====
+
+import type { DatasetPayload, DatasetStats, TaskType } from "@/lib/domain";
+import { mean, mulberry32, pearson, shuffleInPlace, std } from "@/lib/ml/math";
+
+export interface Scaler {
+  mean: number[];
+  scale: number[];
+}
+
+export function fitScaler(X: number[][]): Scaler {
+  if (X.length === 0) return { mean: [], scale: [] };
+  const cols = X[0].length;
+  const means: number[] = [];
+  const scales: number[] = [];
+  for (let j = 0; j < cols; j += 1) {
+    const col = X.map((row) => row[j]);
+    const mu = mean(col);
+    const sigma = std(col);
+    means.push(mu);
+    scales.push(sigma < 1e-9 ? 1 : sigma);
+  }
+  return { mean: means, scale: scales };
+}
+
+export function applyScaler(X: number[][], scaler: Scaler) {
+  return X.map((row) => row.map((value, j) => (value - scaler.mean[j]) / scaler.scale[j]));
+}
+
+export function trainTestSplit(
+  X: number[][],
+  y: number[],
+  testSize = 0.2,
+  seed = 42,
+): { xTrain: number[][]; yTrain: number[]; xTest: number[][]; yTest: number[] } {
+  const idx = X.map((_, i) => i);
+  shuffleInPlace(idx, mulberry32(seed));
+  const nTest = Math.max(1, Math.floor(idx.length * testSize));
+  const testIdx = idx.slice(0, nTest);
+  const trainIdx = idx.slice(nTest);
+  return {
+    xTrain: trainIdx.map((i) => X[i]),
+    yTrain: trainIdx.map((i) => y[i]),
+    xTest: testIdx.map((i) => X[i]),
+    yTest: testIdx.map((i) => y[i]),
+  };
+}
+
+export function computeDatasetStats(payload: DatasetPayload, taskType: TaskType): DatasetStats {
+  const { X, y, featureNames, targetName, classNames } = payload;
+  const featureSummary = featureNames.map((name, j) => {
+    const col = X.map((row) => row[j]);
+    return {
+      name,
+      mean: mean(col),
+      std: std(col),
+      min: Math.min(...col),
+      max: Math.max(...col),
+    };
+  });
+
+  const correlations = featureNames
+    .map((feature, j) => ({
+      feature,
+      corr: pearson(
+        X.map((row) => row[j]),
+        y,
+      ),
+    }))
+    .sort((a, b) => Math.abs(b.corr) - Math.abs(a.corr));
+
+  const classBalance =
+    taskType === "classification"
+      ? y.reduce<Record<string, number>>((acc, value) => {
+          const label = classNames?.[value] ?? String(value);
+          acc[label] = (acc[label] ?? 0) + 1;
+          return acc;
+        }, {})
+      : undefined;
+
+  return {
+    rowCount: X.length,
+    featureCount: featureNames.length,
+    targetName,
+    featureNames,
+    missingCount: 0,
+    targetMean: mean(y),
+    targetStd: std(y),
+    targetMin: Math.min(...y),
+    targetMax: Math.max(...y),
+    classBalance,
+    featureSummary,
+    correlations,
+  };
+}
+
+export function parseCsv(text: string) {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length < 2) {
+    throw new Error("CSV must include a header and at least one row");
+  }
+  const headers = splitCsvLine(lines[0]);
+  const rows = lines.slice(1).map(splitCsvLine);
+  return { headers, rows };
+}
+
+function splitCsvLine(line: string) {
+  const cells: string[] = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (ch === "," && !inQuotes) {
+      cells.push(current.trim());
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  cells.push(current.trim());
+  return cells;
+}
+
+export function csvToPayload(
+  headers: string[],
+  rows: string[][],
+  targetColumn: string,
+): DatasetPayload {
+  const targetIndex = headers.indexOf(targetColumn);
+  if (targetIndex < 0) {
+    throw new Error(`Target column "${targetColumn}" was not found`);
+  }
+  const featureIndexes = headers
+    .map((name, i) => ({ name, i }))
+    .filter((col) => col.i !== targetIndex);
+
+  const numericFeatureIdx = featureIndexes.filter((col) =>
+    rows.every((row) => row[col.i] === "" || Number.isFinite(Number(row[col.i]))),
+  );
+  if (numericFeatureIdx.length === 0) {
+    throw new Error("No numeric feature columns were detected");
+  }
+
+  const targetValues = rows.map((row) => row[targetIndex]);
+  const targetIsNumeric = targetValues.every((value) => Number.isFinite(Number(value)));
+  let y: number[];
+  let classNames: string[] | undefined;
+  if (targetIsNumeric && new Set(targetValues).size > 12) {
+    y = targetValues.map(Number);
+  } else {
+    classNames = [...new Set(targetValues)];
+    const index = new Map(classNames.map((name, i) => [name, i]));
+    y = targetValues.map((value) => index.get(value) ?? 0);
+  }
+
+  const X = rows.map((row) => numericFeatureIdx.map((col) => Number(row[col.i] || 0)));
+  return {
+    X,
+    y,
+    featureNames: numericFeatureIdx.map((col) => col.name),
+    targetName: targetColumn,
+    classNames,
+  };
+}
+
+===== FILE: src\lib\ml\registry.ts =====
+
+import { z } from "zod";
+import type { HyperParams, ModelName, TaskType } from "@/lib/domain";
+
+export interface ParamSpec {
+  type: "number" | "integer" | "boolean" | "enum";
+  min?: number;
+  max?: number;
+  values?: Array<string | number | boolean>;
+  default: number | string | boolean;
+}
+
+export interface ModelSpec {
+  name: ModelName;
+  label: string;
+  family: "linear" | "neighbor" | "tree" | "ensemble";
+  tasks: TaskType[];
+  description: string;
+  params: Record<string, ParamSpec>;
+}
+
+export const MODEL_REGISTRY: ModelSpec[] = [
+  {
+    name: "linear_regression",
+    label: "Linear Regression",
+    family: "linear",
+    tasks: ["regression"],
+    description: "Ordinary least squares baseline with standardized features.",
+    params: {},
+  },
+  {
+    name: "ridge",
+    label: "Ridge",
+    family: "linear",
+    tasks: ["regression"],
+    description: "L2-regularized linear model for stable coefficients.",
+    params: {
+      alpha: { type: "number", min: 0.0001, max: 1000, default: 1 },
+    },
+  },
+  {
+    name: "lasso",
+    label: "Lasso",
+    family: "linear",
+    tasks: ["regression"],
+    description: "L1-regularized linear model that can zero out weak features.",
+    params: {
+      alpha: { type: "number", min: 0.0001, max: 50, default: 0.05 },
+    },
+  },
+  {
+    name: "elastic_net",
+    label: "Elastic Net",
+    family: "linear",
+    tasks: ["regression"],
+    description: "Combined L1/L2 regularized linear model.",
+    params: {
+      alpha: { type: "number", min: 0.0001, max: 50, default: 0.1 },
+      l1Ratio: { type: "number", min: 0, max: 1, default: 0.5 },
+    },
+  },
+  {
+    name: "logistic_regression",
+    label: "Logistic Regression",
+    family: "linear",
+    tasks: ["classification"],
+    description: "Linear classifier trained with gradient descent.",
+    params: {
+      learningRate: { type: "number", min: 0.01, max: 1, default: 0.2 },
+      epochs: { type: "integer", min: 40, max: 400, default: 180 },
+      l2: { type: "number", min: 0, max: 2, default: 0.01 },
+    },
+  },
+  {
+    name: "knn",
+    label: "k-Nearest Neighbors",
+    family: "neighbor",
+    tasks: ["regression", "classification"],
+    description: "Instance-based predictor using distance-weighted neighbors.",
+    params: {
+      k: { type: "integer", min: 1, max: 40, default: 7 },
+      weighted: { type: "boolean", default: true },
+    },
+  },
+  {
+    name: "decision_tree",
+    label: "Decision Tree",
+    family: "tree",
+    tasks: ["regression", "classification"],
+    description: "Single CART tree with MSE or Gini splits.",
+    params: {
+      maxDepth: { type: "integer", min: 2, max: 16, default: 6 },
+      minSamplesSplit: { type: "integer", min: 2, max: 40, default: 8 },
+      minSamplesLeaf: { type: "integer", min: 1, max: 20, default: 3 },
+    },
+  },
+  {
+    name: "random_forest",
+    label: "Random Forest",
+    family: "ensemble",
+    tasks: ["regression", "classification"],
+    description: "Bagged trees with random feature subsets.",
+    params: {
+      nEstimators: { type: "integer", min: 8, max: 80, default: 24 },
+      maxDepth: { type: "integer", min: 3, max: 16, default: 8 },
+      minSamplesLeaf: { type: "integer", min: 1, max: 12, default: 2 },
+      maxFeatures: { type: "enum", values: ["sqrt", "log2", "all"], default: "sqrt" },
+    },
+  },
+  {
+    name: "gradient_boosting",
+    label: "Gradient Boosting",
+    family: "ensemble",
+    tasks: ["regression", "classification"],
+    description: "Stage-wise additive trees fit to residuals.",
+    params: {
+      nEstimators: { type: "integer", min: 8, max: 80, default: 28 },
+      maxDepth: { type: "integer", min: 1, max: 6, default: 3 },
+      learningRate: { type: "number", min: 0.01, max: 0.5, default: 0.1 },
+      subsample: { type: "number", min: 0.6, max: 1, default: 1 },
+    },
+  },
+];
+
+export const SEARCH_SPACES: Record<string, Array<HyperParams>> = {
+  ridge: [{ alpha: 0.1 }, { alpha: 1 }, { alpha: 10 }, { alpha: 50 }],
+  lasso: [{ alpha: 0.01 }, { alpha: 0.05 }, { alpha: 0.2 }],
+  elastic_net: [
+    { alpha: 0.05, l1Ratio: 0.2 },
+    { alpha: 0.1, l1Ratio: 0.5 },
+    { alpha: 0.2, l1Ratio: 0.8 },
+  ],
+  knn: [
+    { k: 5, weighted: true },
+    { k: 11, weighted: true },
+    { k: 15, weighted: false },
+  ],
+  decision_tree: [
+    { maxDepth: 4, minSamplesLeaf: 4 },
+    { maxDepth: 6, minSamplesLeaf: 3 },
+    { maxDepth: 10, minSamplesLeaf: 2 },
+  ],
+  random_forest: [
+    { nEstimators: 18, maxDepth: 6, minSamplesLeaf: 3, maxFeatures: "sqrt" },
+    { nEstimators: 28, maxDepth: 8, minSamplesLeaf: 2, maxFeatures: "sqrt" },
+    { nEstimators: 36, maxDepth: 12, minSamplesLeaf: 1, maxFeatures: "log2" },
+  ],
+  gradient_boosting: [
+    { nEstimators: 20, maxDepth: 2, learningRate: 0.1, subsample: 1 },
+    { nEstimators: 32, maxDepth: 3, learningRate: 0.08, subsample: 0.9 },
+    { nEstimators: 40, maxDepth: 3, learningRate: 0.05, subsample: 1 },
+  ],
+  logistic_regression: [
+    { learningRate: 0.15, epochs: 160, l2: 0.02 },
+    { learningRate: 0.25, epochs: 220, l2: 0.005 },
+  ],
+};
+
+export function getModelSpec(name: string) {
+  return MODEL_REGISTRY.find((model) => model.name === name);
+}
+
+export function modelsForTask(task: TaskType) {
+  return MODEL_REGISTRY.filter((model) => model.tasks.includes(task));
+}
+
+export function validateExperimentConfig(modelName: string, params: HyperParams, task: TaskType) {
+  const spec = getModelSpec(modelName);
+  if (!spec) {
+    throw new Error(`Model "${modelName}" is not in the safe registry`);
+  }
+  if (!spec.tasks.includes(task)) {
+    throw new Error(`Model "${modelName}" cannot be used for ${task}`);
+  }
+
+  const cleaned: HyperParams = {};
+  for (const [key, def] of Object.entries(spec.params)) {
+    const incoming = params[key] ?? def.default;
+    if (def.type === "boolean") {
+      cleaned[key] = Boolean(incoming);
+      continue;
+    }
+    if (def.type === "enum") {
+      if (!def.values?.includes(incoming as never)) {
+        cleaned[key] = def.default;
+      } else {
+        cleaned[key] = incoming;
+      }
+      continue;
+    }
+    const numeric = Number(incoming);
+    if (!Number.isFinite(numeric)) {
+      cleaned[key] = def.default;
+      continue;
+    }
+    const bounded = Math.min(def.max ?? numeric, Math.max(def.min ?? numeric, numeric));
+    cleaned[key] = def.type === "integer" ? Math.round(bounded) : bounded;
+  }
+
+  const extra = Object.keys(params).filter((key) => !(key in spec.params) && key !== "randomState");
+  if (extra.length > 0) {
+    // Ignore unknown keys rather than executing them.
+  }
+  if (typeof params.randomState === "number") cleaned.randomState = Math.round(params.randomState);
+
+  const schema = z.object({
+    model: z.string(),
+    params: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])),
+  });
+  return schema.parse({ model: spec.name, params: cleaned }) as {
+    model: ModelName;
+    params: HyperParams;
+  };
+}
+
+export function configSignature(model: string, params: HyperParams) {
+  const keys = Object.keys(params).sort();
+  return `${model}:${keys.map((key) => `${key}=${String(params[key])}`).join("|")}`;
+}
+
+export function modelLabel(name: string) {
+  return getModelSpec(name)?.label ?? name;
+}
+
+export function familyOf(name: string) {
+  return getModelSpec(name)?.family ?? "linear";
+}
+
+===== FILE: src\lib\ml\tree.ts =====
+
+import { mean, mulberry32, sampleWithoutReplacement, variance } from "@/lib/ml/math";
+
+export interface TreeNode {
+  leaf: boolean;
+  value?: number;
+  feature?: number;
+  threshold?: number;
+  left?: TreeNode;
+  right?: TreeNode;
+  n?: number;
+  impurity?: number;
+}
+
+export interface TreeOptions {
+  maxDepth: number;
+  minSamplesSplit: number;
+  minSamplesLeaf: number;
+  maxFeatures: number | "sqrt" | "log2" | "all";
+  task: "regression" | "classification";
+  seed?: number;
+  nClasses?: number;
+}
+
+function featureCount(maxFeatures: TreeOptions["maxFeatures"], nFeatures: number) {
+  if (maxFeatures === "all") return nFeatures;
+  if (maxFeatures === "sqrt") return Math.max(1, Math.floor(Math.sqrt(nFeatures)));
+  if (maxFeatures === "log2") return Math.max(1, Math.floor(Math.log2(nFeatures)));
+  if (maxFeatures > 0 && maxFeatures < 1) return Math.max(1, Math.floor(maxFeatures * nFeatures));
+  return Math.max(1, Math.min(nFeatures, Math.floor(maxFeatures)));
+}
+
+function majorityClass(y: number[], idx: number[]) {
+  const counts = new Map<number, number>();
+  for (const i of idx) counts.set(y[i], (counts.get(y[i]) ?? 0) + 1);
+  let best = y[idx[0]] ?? 0;
+  let bestCount = -1;
+  for (const [label, count] of counts) {
+    if (count > bestCount) {
+      best = label;
+      bestCount = count;
+    }
+  }
+  return best;
+}
+
+function gini(counts: Map<number, number>, n: number) {
+  if (n === 0) return 0;
+  let sum = 0;
+  for (const count of counts.values()) {
+    const p = count / n;
+    sum += p * p;
+  }
+  return 1 - sum;
+}
+
+interface Split {
+  feature: number;
+  threshold: number;
+  gain: number;
+}
+
+function bestSplit(
+  X: number[][],
+  y: number[],
+  idx: number[],
+  options: TreeOptions,
+  rng: () => number,
+): Split | null {
+  const nFeatures = X[0]?.length ?? 0;
+  const k = featureCount(options.maxFeatures, nFeatures);
+  const features = sampleWithoutReplacement(
+    Array.from({ length: nFeatures }, (_, i) => i),
+    k,
+    rng,
+  );
+  const n = idx.length;
+  let parentImpurity = 0;
+  let totalSum = 0;
+  let totalSumSq = 0;
+  const parentCounts = new Map<number, number>();
+
+  if (options.task === "regression") {
+    const values = idx.map((i) => y[i]);
+    parentImpurity = variance(values) * n;
+    for (const value of values) {
+      totalSum += value;
+      totalSumSq += value * value;
+    }
+  } else {
+    for (const i of idx) parentCounts.set(y[i], (parentCounts.get(y[i]) ?? 0) + 1);
+    parentImpurity = gini(parentCounts, n) * n;
+  }
+
+  let best: Split | null = null;
+
+  for (const feature of features) {
+    const ordered = idx
+      .map((i) => ({ i, v: X[i][feature] }))
+      .sort((a, b) => a.v - b.v);
+    if (ordered[0].v === ordered[ordered.length - 1].v) continue;
+
+    let leftSum = 0;
+    let leftSumSq = 0;
+    let leftN = 0;
+    const leftCounts = new Map<number, number>();
+
+    for (let t = 0; t < ordered.length - options.minSamplesLeaf; t += 1) {
+      const yi = y[ordered[t].i];
+      leftN += 1;
+      if (options.task === "regression") {
+        leftSum += yi;
+        leftSumSq += yi * yi;
+      } else {
+        leftCounts.set(yi, (leftCounts.get(yi) ?? 0) + 1);
+      }
+      if (leftN < options.minSamplesLeaf) continue;
+      if (t + 1 < ordered.length && ordered[t].v === ordered[t + 1].v) continue;
+      const rightN = n - leftN;
+      if (rightN < options.minSamplesLeaf) continue;
+
+      let gain = 0;
+      if (options.task === "regression") {
+        const leftSSE = leftSumSq - (leftSum * leftSum) / leftN;
+        const rightSum = totalSum - leftSum;
+        const rightSumSq = totalSumSq - leftSumSq;
+        const rightSSE = rightSumSq - (rightSum * rightSum) / rightN;
+        gain = parentImpurity - leftSSE - rightSSE;
+      } else {
+        const rightCounts = new Map<number, number>();
+        for (const [label, count] of parentCounts) {
+          const l = leftCounts.get(label) ?? 0;
+          const r = count - l;
+          if (r > 0) rightCounts.set(label, r);
+        }
+        const leftG = gini(leftCounts, leftN) * leftN;
+        const rightG = gini(rightCounts, rightN) * rightN;
+        gain = parentImpurity - leftG - rightG;
+      }
+
+      if (!best || gain > best.gain) {
+        best = {
+          feature,
+          threshold: (ordered[t].v + ordered[t + 1].v) / 2,
+          gain,
+        };
+      }
+    }
+  }
+
+  if (!best || best.gain <= 1e-12) return null;
+  return best;
+}
+
+function build(
+  X: number[][],
+  y: number[],
+  idx: number[],
+  depth: number,
+  options: TreeOptions,
+  rng: () => number,
+  importances: number[],
+): TreeNode {
+  const values = idx.map((i) => y[i]);
+  const leafValue = options.task === "classification" ? majorityClass(y, idx) : mean(values);
+  const impurity = options.task === "classification" ? 0 : variance(values);
+
+  if (
+    depth >= options.maxDepth ||
+    idx.length < options.minSamplesSplit ||
+    new Set(values).size === 1
+  ) {
+    return { leaf: true, value: leafValue, n: idx.length, impurity };
+  }
+
+  const split = bestSplit(X, y, idx, options, rng);
+  if (!split) {
+    return { leaf: true, value: leafValue, n: idx.length, impurity };
+  }
+
+  const leftIdx: number[] = [];
+  const rightIdx: number[] = [];
+  for (const i of idx) {
+    if (X[i][split.feature] <= split.threshold) leftIdx.push(i);
+    else rightIdx.push(i);
+  }
+  if (leftIdx.length === 0 || rightIdx.length === 0) {
+    return { leaf: true, value: leafValue, n: idx.length, impurity };
+  }
+
+  importances[split.feature] += split.gain;
+  return {
+    leaf: false,
+    feature: split.feature,
+    threshold: split.threshold,
+    n: idx.length,
+    impurity,
+    left: build(X, y, leftIdx, depth + 1, options, rng, importances),
+    right: build(X, y, rightIdx, depth + 1, options, rng, importances),
+  };
+}
+
+export function fitTree(X: number[][], y: number[], options: TreeOptions) {
+  const importances = Array.from({ length: X[0]?.length ?? 0 }, () => 0);
+  const rng = mulberry32(options.seed ?? 7);
+  const tree = build(
+    X,
+    y,
+    X.map((_, i) => i),
+    0,
+    options,
+    rng,
+    importances,
+  );
+  return { tree, importances };
+}
+
+export function predictTree(tree: TreeNode, row: number[]): number {
+  let node = tree;
+  while (!node.leaf && node.left && node.right && node.feature !== undefined) {
+    node = row[node.feature] <= (node.threshold ?? 0) ? node.left : node.right;
+  }
+  return node.value ?? 0;
+}
+
+export function predictTreeMany(tree: TreeNode, X: number[][]) {
+  return X.map((row) => predictTree(tree, row));
+}
+
+export function bootstrapIndices(n: number, rng: () => number) {
+  return Array.from({ length: n }, () => Math.floor(rng() * n));
+}
+
+===== FILE: src\lib\seed.ts =====
+
+import { db } from "@/db";
+import { datasets } from "@/db/schema";
+import { createId } from "@/lib/id";
+import { builtinDatasets, describeBuiltin } from "@/lib/ml/datasets";
+import { logger } from "@/lib/logger";
+
+let seeded = false;
+// Jab do API routes ek saath seeding shuru karte hain, dono ko ek hi promise
+// par wait karana hai â€” warna dono same slug insert karke duplicate key error dete hain.
+let seeding: Promise<void> | null = null;
+
+async function runSeed() {
+  const existing = await db.select({ slug: datasets.slug }).from(datasets);
+  const have = new Set(existing.map((row) => row.slug));
+  const builtins = builtinDatasets();
+
+  for (const dataset of builtins) {
+    if (have.has(dataset.slug)) continue;
+    const described = describeBuiltin(dataset);
+
+    const inserted = await db
+      .insert(datasets)
+      .values({
+        id: createId("ds"),
+        name: described.name,
+        slug: described.slug,
+        source: "builtin",
+        taskType: described.taskType,
+        targetColumn: described.targetColumn,
+        featureColumns: described.featureColumns,
+        rowCount: described.rowCount,
+        description: described.description,
+        stats: described.stats,
+        payload: described.payload,
+      })
+      // Agar koi doosra request pehle hi ye slug daal chuka hai to chup-chaap skip karo.
+      .onConflictDoNothing({ target: datasets.slug })
+      .returning({ slug: datasets.slug });
+
+    if (inserted.length > 0) {
+      logger.info("seed", `Inserted builtin dataset ${dataset.slug}`);
+    } else {
+      logger.info("seed", `Builtin dataset ${dataset.slug} already present, skipped`);
+    }
+  }
+
+  seeded = true;
+}
+
+export async function ensureSeeded() {
+  if (seeded) return;
+  if (!seeding) {
+    seeding = runSeed().finally(() => {
+      seeding = null;
+    });
+  }
+  await seeding;
+}
+
+===== FILE: src\lib\tracking\store.ts =====
+
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { eq } from "drizzle-orm";
+import { db } from "@/db";
+import { experiments, trackingRuns } from "@/db/schema";
+import type { HyperParams, Metrics } from "@/lib/domain";
+import { logger } from "@/lib/logger";
+
+export async function logTrackingRun(input: {
+  id: string;
+  experimentId: string;
+  projectId: string;
+  name: string;
+  params: HyperParams;
+  metrics: Metrics;
+  tags: Record<string, string>;
+}) {
+  const artifactUri = `experiments/mlruns/${input.projectId}/${input.id}`;
+  await db.insert(trackingRuns).values({
+    id: input.id,
+    experimentId: input.experimentId,
+    projectId: input.projectId,
+    name: input.name,
+    params: input.params,
+    metrics: input.metrics,
+    tags: input.tags,
+    artifactUri,
+  });
+
+  await db
+    .update(experiments)
+    .set({ trackingUri: artifactUri })
+    .where(eq(experiments.id, input.experimentId));
+
+  try {
+    const dir = path.join(process.cwd(), artifactUri);
+    await mkdir(path.join(dir, "params"), { recursive: true });
+    await mkdir(path.join(dir, "metrics"), { recursive: true });
+    await mkdir(path.join(dir, "tags"), { recursive: true });
+    await writeFile(
+      path.join(dir, "meta.yaml"),
+      [
+        `run_id: ${input.id}`,
+        `experiment_id: ${input.experimentId}`,
+        `name: ${input.name}`,
+        `status: FINISHED`,
+        `start_time: ${Date.now()}`,
+      ].join("\n"),
+    );
+    await Promise.all(
+      Object.entries(input.params).map(([key, value]) =>
+        writeFile(path.join(dir, "params", key), String(value)),
+      ),
+    );
+    await Promise.all(
+      Object.entries(input.metrics)
+        .filter(([, value]) => typeof value === "number")
+        .map(([key, value]) => writeFile(path.join(dir, "metrics", key), String(value))),
+    );
+    await Promise.all(
+      Object.entries(input.tags).map(([key, value]) => writeFile(path.join(dir, "tags", key), value)),
+    );
+  } catch (error) {
+    logger.warn("tracking", "Unable to persist MLflow-style files", error);
+  }
+}

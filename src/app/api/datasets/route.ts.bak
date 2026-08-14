@@ -1,0 +1,49 @@
+import { desc } from "drizzle-orm";
+import { db } from "@/db";
+import { datasets } from "@/db/schema";
+import { jsonError, publicDataset } from "@/lib/api";
+import { createId } from "@/lib/id";
+import { computeDatasetStats, csvToPayload, parseCsv } from "@/lib/ml/preprocess";
+import { ensureSeeded } from "@/lib/seed";
+
+export const dynamic = "force-dynamic";
+
+export async function GET() {
+  await ensureSeeded();
+  const rows = await db.select().from(datasets).orderBy(desc(datasets.createdAt));
+  return Response.json({ datasets: rows.map(publicDataset) });
+}
+
+export async function POST(request: Request) {
+  await ensureSeeded();
+  const form = await request.formData();
+  const file = form.get("file");
+  const targetColumn = String(form.get("targetColumn") ?? "");
+  const name = String(form.get("name") ?? "").trim();
+  if (!(file instanceof File)) return jsonError("Upload a CSV file");
+  if (!targetColumn) return jsonError("Choose a target column");
+
+  const text = await file.text();
+  const parsed = parseCsv(text);
+  if (parsed.rows.length > 5000) return jsonError("Please keep uploaded CSVs to 5,000 rows or fewer");
+  const payload = csvToPayload(parsed.headers, parsed.rows, targetColumn);
+  const taskType = payload.classNames ? "classification" : "regression";
+  const stats = computeDatasetStats(payload, taskType);
+  const [row] = await db
+    .insert(datasets)
+    .values({
+      id: createId("ds"),
+      name: name || file.name.replace(/\.csv$/i, ""),
+      slug: `upload-${Date.now()}`,
+      source: "upload",
+      taskType,
+      targetColumn,
+      featureColumns: payload.featureNames,
+      rowCount: payload.X.length,
+      description: `Uploaded CSV with ${payload.X.length} rows.`,
+      stats,
+      payload,
+    })
+    .returning();
+  return Response.json({ dataset: publicDataset(row) });
+}

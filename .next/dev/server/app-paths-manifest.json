@@ -1,0 +1,6 @@
+{
+  "/api/datasets/route": "app/api/datasets/route.js",
+  "/api/meta/route": "app/api/meta/route.js",
+  "/api/projects/route": "app/api/projects/route.js",
+  "/page": "app/page.js"
+}

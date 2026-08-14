@@ -1,0 +1,70 @@
+import type { FeatureImportance, HyperParams, Metrics, ModelName, TaskType } from "@/lib/domain";
+import { evaluatePredictions } from "@/lib/ml/metrics";
+import { predictModel, trainModel } from "@/lib/ml/models";
+import { trainTestSplit } from "@/lib/ml/preprocess";
+import { validateExperimentConfig } from "@/lib/ml/registry";
+
+export interface EngineResult {
+  model: ModelName;
+  params: HyperParams;
+  trainMetrics: Metrics;
+  testMetrics: Metrics;
+  durationMs: number;
+  featureImportance: FeatureImportance[];
+  preview: { y: number[]; pred: number[] };
+  coefficients: Record<string, number> | null;
+}
+
+export function runSafeExperiment(input: {
+  model: string;
+  params: HyperParams;
+  task: TaskType;
+  X: number[][];
+  y: number[];
+  featureNames: string[];
+  seed?: number;
+}): EngineResult {
+  const validated = validateExperimentConfig(input.model, input.params, input.task);
+  const split = trainTestSplit(input.X, input.y, 0.2, input.seed ?? 42);
+  const started = Date.now();
+  const trained = trainModel({
+    model: validated.model,
+    task: input.task,
+    X: split.xTrain,
+    y: split.yTrain,
+    params: validated.params,
+  });
+  const trainPred = predictModel(trained, split.xTrain);
+  const testPred = predictModel(trained, split.xTest);
+  const durationMs = Date.now() - started;
+
+  const importanceSource = trained.importances ?? [];
+  const total = importanceSource.reduce((sum, value) => sum + Math.abs(value), 0) || 1;
+  const featureImportance = input.featureNames.map((name, i) => ({
+    name,
+    importance: Math.abs(importanceSource[i] ?? 0) / total,
+  }));
+
+  let coefficients: Record<string, number> | null = null;
+  if (trained.weights && trained.intercept !== undefined) {
+    coefficients = { intercept: trained.intercept };
+    input.featureNames.forEach((name, i) => {
+      coefficients![name] = trained.weights?.[i] ?? 0;
+    });
+  }
+
+  const previewCount = Math.min(80, split.yTest.length);
+  return {
+    model: validated.model,
+    params: validated.params,
+    trainMetrics: evaluatePredictions(input.task, split.yTrain, trainPred),
+    testMetrics: evaluatePredictions(input.task, split.yTest, testPred),
+    durationMs,
+    featureImportance,
+    preview: {
+      y: split.yTest.slice(0, previewCount),
+      pred: testPred.slice(0, previewCount),
+    },
+    coefficients,
+  };
+}
